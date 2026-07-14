@@ -1,0 +1,28 @@
+[project]
+name = "simplismart-deployment-manager"
+version = "0.1.0"
+description = "Production-oriented CLI for managing Simplismart deployments"
+readme = "README.md"
+authors = [
+    { name = "shivam bansal", email = "shivamban30@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-settings>=2.14.2",
+    "rich>=15.0.0",
+    "simplismart-sdk>=0.1.8",
+    "typer>=0.26.8",
+]
+
+[project.scripts]
+simplismart-deployment-manager = "simplismart_deployment_manager.cli:app"
+ssdm = "simplismart_deployment_manager.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.15,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
