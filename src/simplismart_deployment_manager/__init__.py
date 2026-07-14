@@ -1,1 +1,0 @@
-"""Simplismart deployment manager."""

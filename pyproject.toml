@@ -1,5 +1,5 @@
 [project]
-name = "simplismart-deployment-manager"
+name = "simplismart-deployment-cli"
 version = "0.1.0"
 description = "Production-oriented CLI for managing Simplismart deployments"
 readme = "README.md"
@@ -15,8 +15,8 @@ dependencies = [
 ]
 
 [project.scripts]
-simplismart-deployment-manager = "simplismart_deployment_manager.cli:app"
-ssdm = "simplismart_deployment_manager.cli:app"
+simplismart-deploy = "simplismart_deployment_cli.cli:app"
+ssdeploy = "simplismart_deployment_cli.cli:app"
 
 [build-system]
 requires = ["uv_build>=0.9.15,<0.10.0"]

@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from simplismart_deployment_manager.manager import DeploymentManager
-from simplismart_deployment_manager.settings import Settings
+from simplismart_deployment_cli.manager import DeploymentManager
+from simplismart_deployment_cli.settings import Settings
 
 
 class FakeClient:

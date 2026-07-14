@@ -52,7 +52,7 @@ app.add_typer(schedule_app, name="schedule")
 
 def _version_callback(value: bool) -> None:
     if value:
-        typer.echo(version("simplismart-deployment-manager"))
+        typer.echo(version("simplismart-deployment-cli"))
         raise typer.Exit()
 
 

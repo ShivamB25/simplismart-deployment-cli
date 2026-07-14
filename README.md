@@ -1,6 +1,6 @@
-# Simplismart Deployment Manager
+# Simplismart Deployment CLI
 
-One-shot, automation-safe CLI around the
+A community-built, one-shot, automation-safe CLI around the
 [Simplismart Python SDK](https://docs.simplismart.ai/sdk/python/overview).
 It manages deployment lifecycle operations and native Simplismart cron
 scaling without keeping a Python scheduler process alive.
@@ -45,29 +45,29 @@ flag, so it is not exposed in process listings.
 Run commands through uv during development:
 
 ```bash
-uv run ssdm --help
+uv run simplismart-deploy --help
 ```
 
-After installing the package, both `ssdm` and
-`simplismart-deployment-manager` are available.
+After installing the package, use `simplismart-deploy` or its short alias,
+`ssdeploy`.
 
 ## Deployment commands
 
 ```bash
 # JSON output is the default
-uv run ssdm list
-uv run ssdm list --status DEPLOYED --count 50
-uv run ssdm get DEPLOYMENT_UUID
-uv run ssdm start DEPLOYMENT_UUID
-uv run ssdm stop DEPLOYMENT_UUID
-uv run ssdm restart DEPLOYMENT_UUID --namespace MODEL_NAMESPACE
-uv run ssdm health DEPLOYMENT_UUID
+uv run simplismart-deploy list
+uv run simplismart-deploy list --status DEPLOYED --count 50
+uv run simplismart-deploy get DEPLOYMENT_UUID
+uv run simplismart-deploy start DEPLOYMENT_UUID
+uv run simplismart-deploy stop DEPLOYMENT_UUID
+uv run simplismart-deploy restart DEPLOYMENT_UUID --namespace MODEL_NAMESPACE
+uv run simplismart-deploy health DEPLOYMENT_UUID
 
 # Human-readable output
-uv run ssdm --output table list
+uv run simplismart-deploy --output table list
 
 # Readiness gate for scripts and Kubernetes probes
-uv run ssdm health DEPLOYMENT_UUID --require-healthy
+uv run simplismart-deploy health DEPLOYMENT_UUID --require-healthy
 ```
 
 `ORG_ID` is used by lifecycle operations when the API requires it. Override it
@@ -80,7 +80,7 @@ Keep two replicas running from 09:00 to 18:00 on weekdays in Asia/Kolkata,
 with zero replicas outside that window:
 
 ```bash
-uv run ssdm schedule set DEPLOYMENT_UUID \
+uv run simplismart-deploy schedule set DEPLOYMENT_UUID \
   --timezone Asia/Kolkata \
   --start '0 9 * * 1-5' \
   --end '0 18 * * 1-5' \
@@ -95,7 +95,7 @@ at the same time.
 Remove the window and leave a normal non-zero replica range:
 
 ```bash
-uv run ssdm schedule clear DEPLOYMENT_UUID \
+uv run simplismart-deploy schedule clear DEPLOYMENT_UUID \
   --min-replicas 1 \
   --max-replicas 2
 ```
@@ -111,8 +111,8 @@ Simplismart. Each invocation is finite and returns a process exit code, so the
 same command works in crontab, a CI runner, or a Kubernetes CronJob:
 
 ```cron
-0 9 * * 1-5 cd /opt/simplismart-deployment-manager && /usr/local/bin/uv run ssdm start DEPLOYMENT_UUID
-0 18 * * 1-5 cd /opt/simplismart-deployment-manager && /usr/local/bin/uv run ssdm stop DEPLOYMENT_UUID
+0 9 * * 1-5 cd /opt/simplismart-deployment-cli && /usr/local/bin/uv run simplismart-deploy start DEPLOYMENT_UUID
+0 18 * * 1-5 cd /opt/simplismart-deployment-cli && /usr/local/bin/uv run simplismart-deploy stop DEPLOYMENT_UUID
 ```
 
 Inject `SIMPLISMART_PG_TOKEN` and `ORG_ID` from the scheduler's secret store.

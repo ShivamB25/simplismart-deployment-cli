@@ -4,7 +4,7 @@ from typing import Any
 
 from typer.testing import CliRunner
 
-from simplismart_deployment_manager import cli
+from simplismart_deployment_cli import cli
 
 runner = CliRunner()
 
