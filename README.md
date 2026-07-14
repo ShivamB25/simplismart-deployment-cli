@@ -28,12 +28,14 @@ cp .env.example .env
 ```
 
 Set the Playground token from Simplismart **Settings → API Key** in `.env`.
-`ORG_ID` is configuration, not a secret, but keeping it beside the token makes
-local and scheduled invocations consistent.
+`ORG_ID` and `SIMPLISMART_NAMESPACE` are configuration rather than secrets.
+Keeping them beside the token makes local and scheduled invocations consistent,
+and lets `restart` run without repetitive flags.
 
 ```dotenv
 SIMPLISMART_PG_TOKEN=replace-me
 ORG_ID=replace-with-org-uuid
+SIMPLISMART_NAMESPACE=replace-with-kubernetes-namespace
 ```
 
 The Simplismart API URL (`https://api.app.simplismart.ai`) and 300-second
@@ -58,21 +60,30 @@ After installing the package, use `simplismart-deploy` or its short alias,
 uv run simplismart-deploy list
 uv run simplismart-deploy list --status DEPLOYED --count 50
 uv run simplismart-deploy get DEPLOYMENT_UUID
+uv run simplismart-deploy status DEPLOYMENT_UUID
 uv run simplismart-deploy start DEPLOYMENT_UUID
 uv run simplismart-deploy stop DEPLOYMENT_UUID
-uv run simplismart-deploy restart DEPLOYMENT_UUID --namespace MODEL_NAMESPACE
+uv run simplismart-deploy restart DEPLOYMENT_UUID
 uv run simplismart-deploy health DEPLOYMENT_UUID
 
-# Human-readable output
+# Human-readable output; SIMPLISMART_OUTPUT=table also works
 uv run simplismart-deploy --output table list
 
-# Readiness gate for scripts and Kubernetes probes
+# Wait for the accepted action to reach its real terminal condition
+uv run simplismart-deploy start DEPLOYMENT_UUID --wait
+uv run simplismart-deploy stop DEPLOYMENT_UUID --wait
+uv run simplismart-deploy restart DEPLOYMENT_UUID --wait --wait-timeout 900
+
+# Readiness gates for scripts and Kubernetes probes
 uv run simplismart-deploy health DEPLOYMENT_UUID --require-healthy
+uv run simplismart-deploy health DEPLOYMENT_UUID --wait --wait-timeout 900
 ```
 
-`ORG_ID` is used by lifecycle operations when the API requires it. Override it
-for one invocation with the root `--org-id` option or the command-level option
-on `start`, `stop`, and `restart`.
+`ORG_ID` is used by lifecycle operations when the API requires it. `restart`
+also needs the Kubernetes namespace; it resolves both from command options,
+environment configuration, or deployment details, in that order.
+`--wait` polls read-only status endpoints, prints progress only on an interactive
+terminal, and emits one final JSON document when the target is reached.
 
 ## Native schedule-based scaling
 
@@ -130,6 +141,7 @@ or retry destructive lifecycle actions.
 | `4` | Deployment not found |
 | `5` | Other Simplismart API failure |
 | `6` | `health --require-healthy` reported a non-healthy state |
+| `7` | A waited lifecycle action failed or timed out |
 | `70` | Unexpected local software failure |
 
 ## Development

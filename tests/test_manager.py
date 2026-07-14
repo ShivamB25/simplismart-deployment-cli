@@ -4,7 +4,10 @@ from typing import Any
 
 import pytest
 
-from simplismart_deployment_cli.manager import DeploymentManager
+from simplismart_deployment_cli.manager import (
+    DeploymentManager,
+    DeploymentWaitTimeout,
+)
 from simplismart_deployment_cli.settings import Settings
 
 
@@ -32,6 +35,40 @@ class FakeClient:
     def update_deployment_autoscaling(self, **kwargs: Any) -> dict[str, bool]:
         self.calls.append(("autoscaling", kwargs))
         return {"accepted": True}
+
+
+class SequenceClient(FakeClient):
+    def __init__(
+        self,
+        details: list[dict[str, Any]],
+        health: list[dict[str, Any]],
+    ) -> None:
+        super().__init__()
+        self._details = details
+        self._health = health
+
+    def get_model_deployment(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("get", kwargs))
+        if len(self._details) > 1:
+            return self._details.pop(0)
+        return self._details[0]
+
+    def fetch_deployment_health(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("health", kwargs))
+        if len(self._health) > 1:
+            return self._health.pop(0)
+        return self._health[0]
+
+
+class FakeTime:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def now(self) -> float:
+        return self.value
+
+    def sleep(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def settings(org_id: str | None = "org-1") -> Settings:
@@ -117,3 +154,85 @@ def test_restart_requires_an_organization() -> None:
 
     with pytest.raises(ValueError, match="ORG_ID"):
         manager.restart("deployment-1", namespace="model-serving")
+
+
+def test_restart_infers_org_and_namespace_from_deployment() -> None:
+    client = FakeClient(
+        {
+            "status": "DEPLOYED",
+            "org": {"uuid": "org-inferred"},
+            "namespace": "model-serving",
+        }
+    )
+    manager = DeploymentManager(settings(org_id=None), client=client)
+
+    result = manager.restart("deployment-1")
+
+    assert result["changed"] is True
+    assert client.calls[-1] == (
+        "restart",
+        {
+            "deployment_id": "deployment-1",
+            "org_id": "org-inferred",
+            "namespace": "model-serving",
+        },
+    )
+
+
+def test_wait_reaches_deployed_and_healthy_without_real_sleep() -> None:
+    client = SequenceClient(
+        details=[
+            {"status": "PENDING"},
+            {"status": "DEPLOYED"},
+            {"status": "DEPLOYED"},
+        ],
+        health=[
+            {"data": "Progressing"},
+            {"data": "Healthy", "pods": {"ready": 1, "not_ready": 0}},
+        ],
+    )
+    fake_time = FakeTime()
+    manager = DeploymentManager(
+        settings(),
+        client=client,
+        clock=fake_time.now,
+        sleeper=fake_time.sleep,
+    )
+    progress: list[str] = []
+
+    result = manager.wait_for_status(
+        "deployment-1",
+        target_status="DEPLOYED",
+        require_healthy=True,
+        timeout=10,
+        poll_interval=1,
+        on_progress=progress.append,
+    )
+
+    assert result["deployment"]["status"] == "DEPLOYED"
+    assert result["health"]["data"] == "Healthy"
+    assert fake_time.value == 2
+    assert progress == ["status=PENDING", "status=DEPLOYED, health=PROGRESSING"]
+
+
+def test_wait_timeout_reports_last_observed_state() -> None:
+    client = SequenceClient(
+        details=[{"status": "PENDING"}],
+        health=[{"data": "Progressing"}],
+    )
+    fake_time = FakeTime()
+    manager = DeploymentManager(
+        settings(),
+        client=client,
+        clock=fake_time.now,
+        sleeper=fake_time.sleep,
+    )
+
+    with pytest.raises(DeploymentWaitTimeout, match="last status=PENDING"):
+        manager.wait_for_status(
+            "deployment-1",
+            target_status="DEPLOYED",
+            require_healthy=True,
+            timeout=2,
+            poll_interval=1,
+        )

@@ -14,8 +14,15 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    pg_token: SecretStr = Field(validation_alias="SIMPLISMART_PG_TOKEN")
+    pg_token: SecretStr = Field(
+        min_length=1,
+        validation_alias="SIMPLISMART_PG_TOKEN",
+    )
     org_id: str | None = Field(default=None, validation_alias="ORG_ID")
+    deployment_namespace: str | None = Field(
+        default=None,
+        validation_alias="SIMPLISMART_NAMESPACE",
+    )
     base_url: str = Field(
         default="https://api.app.simplismart.ai",
         validation_alias="SIMPLISMART_BASE_URL",
