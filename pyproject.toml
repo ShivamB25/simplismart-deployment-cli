@@ -12,6 +12,7 @@ dependencies = [
     "rich>=15.0.0",
     "simplismart-sdk>=0.1.8",
     "typer>=0.26.8",
+    "tzlocal>=5.4.4",
 ]
 
 [project.scripts]

@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from importlib.metadata import version
+from math import ceil
+from time import sleep
 from typing import Any, Annotated
 
 import typer
@@ -14,8 +17,13 @@ from rich.markup import escape
 from rich.table import Table
 from simplismart import SimplismartError
 
-from .manager import DeploymentManager, DeploymentWaitError
+from .manager import (
+    DeploymentManager,
+    DeploymentNotFoundError,
+    DeploymentWaitError,
+)
 from .settings import Settings
+from .scheduling import DailyWindow, local_timezone_name
 
 EXIT_CONFIG = 2
 EXIT_AUTH = 3
@@ -28,6 +36,23 @@ HEALTHY_STATUS = "healthy"
 VALID_DEPLOYMENT_STATUSES = {"DEPLOYED", "PENDING", "FAILED", "STOPPED", "DELETED"}
 DEFAULT_WAIT_TIMEOUT = 600.0
 DEFAULT_POLL_INTERVAL = 5.0
+SCHEDULE_RETRY_SECONDS = 30.0
+SCHEDULE_SLEEP_CHUNK_SECONDS = 30.0
+RETRYABLE_SCHEDULE_EXIT_CODES = {EXIT_API, EXIT_WAIT_FAILED}
+REDACTED = "<redacted>"
+SENSITIVE_OUTPUT_KEYS = {
+    "api_details",
+    "env_variables",
+    "environment_variables",
+}
+SENSITIVE_OUTPUT_FRAGMENTS = (
+    "api_key",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 console = Console()
 error_console = Console(stderr=True)
@@ -36,6 +61,15 @@ error_console = Console(stderr=True)
 class OutputFormat(str, Enum):
     json = "json"
     table = "table"
+
+
+DeploymentReference = Annotated[
+    str,
+    typer.Argument(
+        metavar="DEPLOYMENT",
+        help="Exact deployment name or UUID.",
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -54,7 +88,9 @@ app = typer.Typer(
     rich_markup_mode="rich",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-schedule_app = typer.Typer(help="Manage native Simplismart cron scaling windows.")
+schedule_app = typer.Typer(
+    help="Manage deployment schedules and native Simplismart cron scaling."
+)
 app.add_typer(schedule_app, name="schedule")
 
 
@@ -68,14 +104,14 @@ def _version_callback(value: bool) -> None:
 def configure(
     ctx: typer.Context,
     output: Annotated[
-        OutputFormat,
+        OutputFormat | None,
         typer.Option(
             "--output",
             "-o",
             envvar="SIMPLISMART_OUTPUT",
-            help="Output format. JSON is stable for automation.",
+            help="Output format. Defaults to table on a terminal and JSON when redirected.",
         ),
-    ] = OutputFormat.json,
+    ] = None,
     org_id: Annotated[
         str | None,
         typer.Option("--org-id", help="Override ORG_ID for this invocation."),
@@ -110,7 +146,13 @@ def configure(
         }.items()
         if value is not None
     }
-    ctx.obj = RuntimeOptions(output=output, settings_overrides=overrides)
+    resolved_output = output or (
+        OutputFormat.table if console.is_terminal else OutputFormat.json
+    )
+    ctx.obj = RuntimeOptions(
+        output=resolved_output,
+        settings_overrides=overrides,
+    )
 
 
 @app.command("list")
@@ -146,13 +188,13 @@ def list_deployments(
 
 
 @app.command("get")
-def get_deployment(ctx: typer.Context, deployment_id: str) -> None:
+def get_deployment(ctx: typer.Context, deployment_id: DeploymentReference) -> None:
     """Show the complete deployment record."""
     _execute(ctx, lambda manager: manager.get(deployment_id))
 
 
 @app.command()
-def status(ctx: typer.Context, deployment_id: str) -> None:
+def status(ctx: typer.Context, deployment_id: DeploymentReference) -> None:
     """Show deployment state and health together."""
     _execute(ctx, lambda manager: manager.status(deployment_id))
 
@@ -160,7 +202,7 @@ def status(ctx: typer.Context, deployment_id: str) -> None:
 @app.command()
 def start(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
     wait: Annotated[
         bool,
@@ -195,7 +237,7 @@ def start(
 @app.command()
 def stop(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
     wait: Annotated[
         bool,
@@ -230,7 +272,7 @@ def stop(
 @app.command()
 def restart(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     namespace: Annotated[
         str | None,
         typer.Option(
@@ -276,7 +318,7 @@ def restart(
 @app.command()
 def health(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     require_healthy: Annotated[
         bool,
         typer.Option(help=f"Exit {EXIT_UNHEALTHY} unless Simplismart reports Healthy."),
@@ -318,10 +360,13 @@ def health(
 @schedule_app.command("set")
 def set_schedule(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     start: Annotated[str, typer.Option("--start", help="Cron expression for window start.")],
     end: Annotated[str, typer.Option("--end", help="Cron expression for window end.")],
-    timezone: Annotated[str, typer.Option(help="IANA timezone, for example UTC.")] = "UTC",
+    timezone: Annotated[
+        str | None,
+        typer.Option(help="IANA timezone; defaults to the system timezone."),
+    ] = None,
     desired_replicas: Annotated[int, typer.Option(min=1)] = 1,
     max_replicas: Annotated[int, typer.Option(min=1)] = 1,
 ) -> None:
@@ -332,7 +377,7 @@ def set_schedule(
         ctx,
         lambda manager: manager.set_schedule(
             deployment_id,
-            timezone=timezone,
+            timezone=timezone or local_timezone_name(),
             start=start,
             end=end,
             desired_replicas=desired_replicas,
@@ -341,10 +386,207 @@ def set_schedule(
     )
 
 
+@schedule_app.command("daily")
+def daily_schedule(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+    on_at: Annotated[
+        str,
+        typer.Option("--on-at", help="Daily start time, for example 10:00 or 10am."),
+    ],
+    off_at: Annotated[
+        str,
+        typer.Option("--off-at", help="Daily stop time, for example 01:00 or 1am."),
+    ],
+    timezone: Annotated[
+        str | None,
+        typer.Option(help="IANA timezone; defaults to the system timezone."),
+    ] = None,
+    desired_replicas: Annotated[int, typer.Option(min=1)] = 1,
+    max_replicas: Annotated[int, typer.Option(min=1)] = 1,
+) -> None:
+    """Configure a durable native daily window using human clock times."""
+    if desired_replicas > max_replicas:
+        _fail("--desired-replicas cannot exceed --max-replicas", EXIT_CONFIG)
+    _execute(
+        ctx,
+        lambda manager: _configure_daily_schedule(
+            manager,
+            deployment_id=deployment_id,
+            on_at=on_at,
+            off_at=off_at,
+            timezone=timezone,
+            desired_replicas=desired_replicas,
+            max_replicas=max_replicas,
+        ),
+    )
+
+
+@schedule_app.command("show")
+def show_schedule(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+) -> None:
+    """Show the current replica and native schedule configuration."""
+    _execute(ctx, lambda manager: _schedule_view(manager, deployment_id))
+
+
+@schedule_app.command("reconcile")
+def reconcile_schedule(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+    on_at: Annotated[
+        str,
+        typer.Option("--on-at", help="Desired daily start time."),
+    ],
+    off_at: Annotated[
+        str,
+        typer.Option("--off-at", help="Desired daily stop time."),
+    ],
+    timezone: Annotated[
+        str | None,
+        typer.Option(help="IANA timezone; defaults to the system timezone."),
+    ] = None,
+    org_id: Annotated[str | None, typer.Option("--org-id")] = None,
+    wait: Annotated[
+        bool,
+        typer.Option("--wait", help="Wait for the desired state to be reached."),
+    ] = False,
+    wait_timeout: Annotated[
+        float,
+        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+    ] = DEFAULT_WAIT_TIMEOUT,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", min=0.1, help="Status polling interval."),
+    ] = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Apply the correct state now; safe for boot, cron, or wake catch-up."""
+    _execute(
+        ctx,
+        lambda manager: _reconcile_daily_schedule(
+            ctx,
+            manager,
+            deployment_id=deployment_id,
+            on_at=on_at,
+            off_at=off_at,
+            timezone=timezone,
+            org_id=org_id,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+        ),
+    )
+
+
+@schedule_app.command("run")
+def run_schedule(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+    on_at: Annotated[
+        str,
+        typer.Option("--on-at", help="Desired daily start time."),
+    ],
+    off_at: Annotated[
+        str,
+        typer.Option("--off-at", help="Desired daily stop time."),
+    ],
+    timezone: Annotated[
+        str | None,
+        typer.Option(help="IANA timezone; defaults to the system timezone."),
+    ] = None,
+    org_id: Annotated[str | None, typer.Option("--org-id")] = None,
+    wait: Annotated[
+        bool,
+        typer.Option(
+            "--wait/--no-wait",
+            help="Wait for each lifecycle transition before sleeping.",
+        ),
+    ] = True,
+    wait_timeout: Annotated[
+        float,
+        typer.Option("--wait-timeout", min=1, help="Maximum transition wait."),
+    ] = DEFAULT_WAIT_TIMEOUT,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", min=0.1, help="Status polling interval."),
+    ] = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Run the daily start/stop loop in the foreground."""
+    try:
+        window = DailyWindow.create(
+            on_at=on_at,
+            off_at=off_at,
+            timezone_name=timezone,
+        )
+    except ValueError as exc:
+        _fail(str(exc), EXIT_CONFIG)
+
+    if error_console.is_terminal:
+        error_console.print(
+            "[bold]Running daily lifecycle schedule[/bold]\\n"
+            f"  Deployment: {escape(deployment_id)}\\n"
+            f"  Window: {window.on_at.strftime('%H:%M')} → "
+            f"{window.off_at.strftime('%H:%M')} ({window.timezone_name})\\n"
+            "  Press Ctrl+C to stop."
+        )
+
+    try:
+        while True:
+            now = datetime.now(window.timezone)
+            boundary = window.next_boundary(now)
+            try:
+                _execute(
+                    ctx,
+                    lambda manager: _reconcile_window(
+                        ctx,
+                        manager,
+                        deployment_id=deployment_id,
+                        window=window,
+                        evaluated_at=now,
+                        org_id=org_id,
+                        wait=wait,
+                        wait_timeout=wait_timeout,
+                        poll_interval=poll_interval,
+                    ),
+                    stream=True,
+                )
+            except typer.Exit as exc:
+                if exc.exit_code not in RETRYABLE_SCHEDULE_EXIT_CODES:
+                    raise
+                until_boundary = (
+                    boundary.timestamp()
+                    - datetime.now(window.timezone).timestamp()
+                )
+                retry_in = max(
+                    min(SCHEDULE_RETRY_SECONDS, until_boundary),
+                    0.1,
+                )
+                error_console.print(
+                    f"[yellow]Retrying reconciliation in {retry_in:g}s.[/yellow]"
+                )
+                sleep(retry_in)
+                continue
+
+            remaining = (
+                boundary.timestamp()
+                - datetime.now(window.timezone).timestamp()
+            )
+            if error_console.is_terminal:
+                error_console.print(
+                    f"[dim]Next reconciliation: {boundary.isoformat()} "
+                    f"(in {_format_duration(remaining)})[/dim]"
+                )
+            _sleep_until(boundary, window)
+    except KeyboardInterrupt:
+        error_console.print("[dim]Schedule stopped.[/dim]")
+        raise typer.Exit(130) from None
+
+
 @schedule_app.command("clear")
 def clear_schedule(
     ctx: typer.Context,
-    deployment_id: str,
+    deployment_id: DeploymentReference,
     min_replicas: Annotated[int, typer.Option(min=1)] = 1,
     max_replicas: Annotated[int, typer.Option(min=1)] = 1,
 ) -> None:
@@ -359,6 +601,130 @@ def clear_schedule(
             max_replicas=max_replicas,
         ),
     )
+
+
+def _configure_daily_schedule(
+    manager: DeploymentManager,
+    *,
+    deployment_id: str,
+    on_at: str,
+    off_at: str,
+    timezone: str | None,
+    desired_replicas: int,
+    max_replicas: int,
+) -> dict[str, Any]:
+    window = DailyWindow.create(
+        on_at=on_at,
+        off_at=off_at,
+        timezone_name=timezone,
+    )
+    result = manager.set_schedule(
+        deployment_id,
+        timezone=window.timezone_name,
+        start=window.on_cron,
+        end=window.off_cron,
+        desired_replicas=desired_replicas,
+        max_replicas=max_replicas,
+    )
+    result["schedule"] = {
+        **window.as_dict(),
+        "mode": "native_cron_scaling",
+        "desired_replicas": desired_replicas,
+        "max_replicas": max_replicas,
+    }
+    return result
+
+
+def _schedule_view(
+    manager: DeploymentManager,
+    deployment_id: str,
+) -> dict[str, Any]:
+    resolved_id = manager.resolve_id(deployment_id)
+    detail = manager.get(resolved_id)
+    if not isinstance(detail, dict):
+        return {"deployment_id": resolved_id, "deployment": detail}
+    return {
+        "deployment_id": resolved_id,
+        "deployment_name": detail.get("deployment_name") or detail.get("name"),
+        "status": detail.get("status") or detail.get("deployment_status"),
+        "min_pod_replicas": detail.get("min_pod_replicas"),
+        "max_pod_replicas": detail.get("max_pod_replicas"),
+        "autoscale_config": (
+            detail.get("autoscale_config")
+            or detail.get("autoscaling_config")
+            or {}
+        ),
+    }
+
+
+def _reconcile_daily_schedule(
+    ctx: typer.Context,
+    manager: DeploymentManager,
+    *,
+    deployment_id: str,
+    on_at: str,
+    off_at: str,
+    timezone: str | None,
+    org_id: str | None,
+    wait: bool,
+    wait_timeout: float,
+    poll_interval: float,
+) -> dict[str, Any]:
+    window = DailyWindow.create(
+        on_at=on_at,
+        off_at=off_at,
+        timezone_name=timezone,
+    )
+    return _reconcile_window(
+        ctx,
+        manager,
+        deployment_id=deployment_id,
+        window=window,
+        evaluated_at=datetime.now(window.timezone),
+        org_id=org_id,
+        wait=wait,
+        wait_timeout=wait_timeout,
+        poll_interval=poll_interval,
+    )
+
+
+def _reconcile_window(
+    ctx: typer.Context,
+    manager: DeploymentManager,
+    *,
+    deployment_id: str,
+    window: DailyWindow,
+    evaluated_at: datetime,
+    org_id: str | None,
+    wait: bool,
+    wait_timeout: float,
+    poll_interval: float,
+) -> dict[str, Any]:
+    active = window.is_active(evaluated_at)
+    action = (
+        manager.start(deployment_id, org_id=org_id)
+        if active
+        else manager.stop(deployment_id, org_id=org_id)
+    )
+    target_status = "DEPLOYED" if active else "STOPPED"
+    result: dict[str, Any] = {
+        "deployment_id": action["deployment_id"],
+        "evaluated_at": evaluated_at.astimezone(window.timezone).isoformat(),
+        "desired_state": target_status,
+        "schedule": window.as_dict(),
+        "action": action,
+    }
+    if wait:
+        result["final_state"] = _wait_for_status(
+            ctx,
+            manager,
+            deployment_id=action["deployment_id"],
+            target_status=target_status,
+            require_healthy=active,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+        )
+    return result
 
 
 def _lifecycle_result(
@@ -427,6 +793,8 @@ def _wait_for_status(
 def _execute(
     ctx: typer.Context,
     operation: Callable[[DeploymentManager], Any],
+    *,
+    stream: bool = False,
 ) -> Any:
     runtime = _runtime(ctx)
     try:
@@ -443,6 +811,8 @@ def _execute(
         else:
             exit_code = EXIT_API
         _fail(str(exc), exit_code, status_code=status_code, payload=getattr(exc, "payload", None))
+    except DeploymentNotFoundError as exc:
+        _fail(str(exc), EXIT_NOT_FOUND)
     except DeploymentWaitError as exc:
         _fail(str(exc), EXIT_WAIT_FAILED)
     except ValueError as exc:
@@ -450,7 +820,13 @@ def _execute(
     except Exception as exc:  # Last-resort stable failure contract for unattended jobs.
         _fail(str(exc), EXIT_SOFTWARE)
 
-    _render(result, runtime.output)
+    if stream and runtime.output is OutputFormat.json:
+        print(
+            json.dumps(_redact(result), default=str, separators=(",", ":")),
+            flush=True,
+        )
+    else:
+        _render(result, runtime.output)
     return result
 
 
@@ -477,16 +853,38 @@ def _validation_message(exc: ValidationError) -> str:
     return "; ".join(messages)
 
 
+def _redact(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    redacted: dict[str, Any] = {}
+    for key, item in value.items():
+        normalized = str(key).lower()
+        if normalized in SENSITIVE_OUTPUT_KEYS:
+            if isinstance(item, dict):
+                redacted[key] = {name: REDACTED for name in item}
+            else:
+                redacted[key] = REDACTED
+        elif any(fragment in normalized for fragment in SENSITIVE_OUTPUT_FRAGMENTS):
+            redacted[key] = None if item is None else REDACTED
+        else:
+            redacted[key] = _redact(item)
+    return redacted
+
+
 def _render(data: Any, output: OutputFormat) -> None:
+    safe_data = _redact(data)
     if output is OutputFormat.json:
-        console.print_json(json.dumps(data, default=str))
+        console.print_json(json.dumps(safe_data, default=str))
         return
 
-    rows = _collection_rows(data)
+    rows = _collection_rows(safe_data)
     if rows is not None:
         _render_rows(rows)
         return
-    _render_record(data)
+    _render_record(safe_data)
 
 
 def _collection_rows(data: Any) -> list[dict[str, Any]] | None:
@@ -549,6 +947,38 @@ def _flatten_record(
     return flattened
 
 
+def _sleep_until(
+    boundary: datetime,
+    window: DailyWindow,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+) -> None:
+    current_time = clock or (lambda: datetime.now(window.timezone))
+    pause = sleeper or sleep
+    while True:
+        remaining = boundary.timestamp() - current_time().timestamp()
+        if remaining <= 0:
+            return
+        pause(min(remaining, SCHEDULE_SLEEP_CHUNK_SECONDS))
+
+
+def _format_duration(seconds: float) -> str:
+    total_minutes = ceil(max(seconds, 0) / 60)
+    if total_minutes == 0:
+        return "<1m"
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
 def _format_value(value: Any) -> str:
     if value is None:
         return "—"
@@ -576,5 +1006,5 @@ def _fail(
         body["status_code"] = status_code
     if payload:
         body["payload"] = payload
-    error_console.print_json(json.dumps(body, default=str))
+    error_console.print_json(json.dumps(_redact(body), default=str))
     raise typer.Exit(exit_code)

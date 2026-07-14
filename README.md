@@ -10,7 +10,7 @@ scaling without keeping a Python scheduler process alive.
 - `start` treats `DEPLOYED` and the in-flight `PENDING` state as successful
   no-ops; `stop` is a no-op when already `STOPPED`. Repeated cron or Kubernetes
   CronJob invocations therefore do not submit duplicate lifecycle actions.
-- JSON is the default output for logs and downstream automation.
+- Tables are automatic on terminals; redirected output is stable JSON.
 - Failures use stable, meaningful exit codes.
 - Scheduled capacity uses Simplismart's native `cronScaling` API. The schedule
   survives this process, uses an explicit IANA timezone, and scales to zero
@@ -56,80 +56,155 @@ After installing the package, use `simplismart-deploy` or its short alias,
 ## Deployment commands
 
 ```bash
-# JSON output is the default
+# Interactive terminals get a table; pipes/files get JSON automatically
 uv run simplismart-deploy list
 uv run simplismart-deploy list --status DEPLOYED --count 50
-uv run simplismart-deploy get DEPLOYMENT_UUID
-uv run simplismart-deploy status DEPLOYMENT_UUID
-uv run simplismart-deploy start DEPLOYMENT_UUID
-uv run simplismart-deploy stop DEPLOYMENT_UUID
-uv run simplismart-deploy restart DEPLOYMENT_UUID
-uv run simplismart-deploy health DEPLOYMENT_UUID
+uv run simplismart-deploy get DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy status DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy start DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy stop DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy restart DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID
 
-# Human-readable output; SIMPLISMART_OUTPUT=table also works
+# Force either format; SIMPLISMART_OUTPUT can set the same preference
 uv run simplismart-deploy --output table list
+uv run simplismart-deploy --output json list
 
 # Wait for the accepted action to reach its real terminal condition
-uv run simplismart-deploy start DEPLOYMENT_UUID --wait
-uv run simplismart-deploy stop DEPLOYMENT_UUID --wait
-uv run simplismart-deploy restart DEPLOYMENT_UUID --wait --wait-timeout 900
+uv run simplismart-deploy start DEPLOYMENT_NAME_OR_UUID --wait
+uv run simplismart-deploy stop DEPLOYMENT_NAME_OR_UUID --wait
+uv run simplismart-deploy restart DEPLOYMENT_NAME_OR_UUID --wait --wait-timeout 900
 
 # Readiness gates for scripts and Kubernetes probes
-uv run simplismart-deploy health DEPLOYMENT_UUID --require-healthy
-uv run simplismart-deploy health DEPLOYMENT_UUID --wait --wait-timeout 900
+uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID --require-healthy
+uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID --wait --wait-timeout 900
 ```
 
-`ORG_ID` is used by lifecycle operations when the API requires it. `restart`
-also needs the Kubernetes namespace; it resolves both from command options,
-environment configuration, or deployment details, in that order.
-`--wait` polls read-only status endpoints, prints progress only on an interactive
-terminal, and emits one final JSON document when the target is reached.
+Every deployment argument accepts either a UUID or an exact deployment name.
+Names must be unique; ambiguous names fail without changing either deployment.
+`ORG_ID` is used when the API requires it. `restart` also needs the Kubernetes
+namespace, resolved from command options, environment configuration, or
+deployment details. `--wait` polls read-only status endpoints, prints progress
+only on an interactive terminal, and emits one final JSON document.
 
-## Native schedule-based scaling
+## Daily schedules
 
-Keep two replicas running from 09:00 to 18:00 on weekdays in Asia/Kolkata,
-with zero replicas outside that window:
+Clock inputs accept both 12-hour and 24-hour forms such as `10am`, `10:00`,
+`1:13 am`, and `01:13`. The timezone defaults to the computer's current local
+IANA timezone. Use `--timezone Asia/Kolkata` (or another IANA name) to make the
+schedule independent of the host configuration.
+
+### Durable native replica window
+
+This is the recommended mode when changing replica capacity is sufficient. It
+stores the schedule in Simplismart, so it continues while this computer is
+asleep or powered off:
 
 ```bash
-uv run simplismart-deploy schedule set DEPLOYMENT_UUID \
-  --timezone Asia/Kolkata \
+uv run simplismart-deploy schedule daily nightly-inference \
+  --on-at 10am \
+  --off-at 1am \
+  --desired-replicas 1 \
+  --max-replicas 1
+```
+
+`10am` → `1am` is treated as an overnight window. The command sets
+`min_replicas=0` and native `cronScaling`; it does not invoke the deployment
+start/stop lifecycle endpoints. Inspect or clear it with:
+
+```bash
+uv run simplismart-deploy schedule show nightly-inference
+uv run simplismart-deploy schedule clear nightly-inference
+```
+
+Advanced cron expressions remain available through `schedule set`:
+
+```bash
+uv run simplismart-deploy schedule set nightly-inference \
   --start '0 9 * * 1-5' \
   --end '0 18 * * 1-5' \
   --desired-replicas 2 \
   --max-replicas 2
 ```
 
-This sets `min_replicas=0` and sends Simplismart a native `cronScaling` rule.
 Simplismart does not allow native cron scaling and traffic-based scale-to-zero
-at the same time.
+at the same time. Schedule clearing explicitly sends an empty `cronScaling`
+list; omitting that field would leave the previous schedule unchanged.
 
-Remove the window and leave a normal non-zero replica range:
+### Foreground lifecycle scheduler
+
+Use this mode when the deployment itself must be started and stopped:
 
 ```bash
-uv run simplismart-deploy schedule clear DEPLOYMENT_UUID \
-  --min-replicas 1 \
-  --max-replicas 2
+uv run simplismart-deploy schedule run nightly-inference \
+  --on-at 10am \
+  --off-at 1am
 ```
 
-The clear operation explicitly sends an empty `cronScaling` list; omitting that
-field would leave an existing schedule unchanged.
+The command immediately reconciles the current local time. Starting it at
+11am starts the deployment unless it is already active, then waits until 1am
+and stops it. Starting it at 2am ensures the deployment is stopped, then waits
+for 10am. Waking late simply causes another current-time reconciliation.
+Lifecycle transitions are idempotent. Transient API and wait failures retry
+with bounded delay; authentication, configuration, and ambiguous-name errors
+stop the process. JSON mode emits one compact JSON object per event (JSONL).
 
-## External cron and Kubernetes CronJobs
+`schedule run` is intentionally a foreground process. For persistence across
+logout or reboot, supervise it with launchd, systemd, or a container service;
+do not rely on `nohup` or a detached terminal process.
 
-Prefer native schedule-based scaling for predictable start/end windows. Use an
-external scheduler only when orchestration must depend on systems outside
-Simplismart. Each invocation is finite and returns a process exit code, so the
-same command works in crontab, a CI runner, or a Kubernetes CronJob:
+Ready-to-edit service definitions are included:
+
+- macOS: `examples/launchd/com.simplismart.deployment-schedule.plist`
+- Linux: `examples/systemd/simplismart-deployment-schedule.service`
+
+Both use `/opt/simplismart-deployment-cli`, the exact deployment name
+`nightly-inference`, and the host's local timezone. Change those values first.
+On macOS, install the launch agent so it starts at login and restarts if it
+exits:
+
+```bash
+cp examples/launchd/com.simplismart.deployment-schedule.plist \
+  ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) \
+  ~/Library/LaunchAgents/com.simplismart.deployment-schedule.plist
+launchctl kickstart -k \
+  gui/$(id -u)/com.simplismart.deployment-schedule
+```
+
+On Linux:
+
+```bash
+sudo cp examples/systemd/simplismart-deployment-schedule.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now simplismart-deployment-schedule.service
+```
+
+### Finite boot or cron reconciliation
+
+For an external scheduler, run the same current-time decision once:
+
+```bash
+uv run simplismart-deploy schedule reconcile nightly-inference \
+  --on-at 10am \
+  --off-at 1am \
+  --wait
+```
+
+This is safe at boot, wake, or every few minutes from cron. If a 10am event was
+missed and the machine starts at 11am, it starts the deployment. If the 1am
+event was missed and the machine starts at 2am, it stops the deployment.
+Inject `SIMPLISMART_PG_TOKEN` and `ORG_ID` from the scheduler's secret store;
+never place credentials in command arguments.
+
+A periodic Linux cron reconciliation provides the same late-boot correction
+without a foreground process. `flock` prevents overlapping invocations:
 
 ```cron
-0 9 * * 1-5 cd /opt/simplismart-deployment-cli && /usr/local/bin/uv run simplismart-deploy start DEPLOYMENT_UUID
-0 18 * * 1-5 cd /opt/simplismart-deployment-cli && /usr/local/bin/uv run simplismart-deploy stop DEPLOYMENT_UUID
+*/5 * * * * cd /opt/simplismart-deployment-cli && flock -n /tmp/simplismart-schedule.lock .venv/bin/simplismart-deploy schedule reconcile nightly-inference --on-at 10am --off-at 1am >> /var/log/simplismart-schedule.log 2>&1
 ```
 
-Inject `SIMPLISMART_PG_TOKEN` and `ORG_ID` from the scheduler's secret store.
-Do not bake them into a crontab, container image, or command arguments. Set a
-failed-job policy in the external scheduler; this CLI does not hide API errors
-or retry destructive lifecycle actions.
+For a Kubernetes CronJob, set `concurrencyPolicy: Forbid` for the same reason.
 
 ## Exit codes
 

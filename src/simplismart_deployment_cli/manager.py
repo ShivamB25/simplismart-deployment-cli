@@ -3,10 +3,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from time import monotonic, sleep
 from typing import Any
+from uuid import UUID
 
 from simplismart import CronScalingRule, Simplismart
 
 from .settings import Settings
+
+
+class DeploymentNotFoundError(ValueError):
+    """No deployment matched an exact name."""
+
+
+class AmbiguousDeploymentError(ValueError):
+    """More than one deployment matched an exact name."""
 
 
 class DeploymentWaitError(RuntimeError):
@@ -52,17 +61,72 @@ class DeploymentManager:
             count=count,
         )
 
-    def get(self, deployment_id: str) -> Any:
+    def resolve_id(self, reference: str) -> str:
+        """Resolve a deployment UUID or an exact, unique deployment name."""
+        try:
+            UUID(reference)
+        except ValueError:
+            pass
+        else:
+            return reference
+
+        matches: dict[str, dict[str, Any]] = {}
+        offset = 0
+        page_size = 100
+        while True:
+            page = self.list(offset=offset, count=page_size)
+            rows = self._result_rows(page)
+            for row in rows:
+                name = row.get("deployment_name") or row.get("name")
+                deployment_id = self._detail_value(row, "deployment_id", "uuid", "id")
+                if name == reference and deployment_id:
+                    matches[deployment_id] = row
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+        if not matches:
+            raise DeploymentNotFoundError(
+                f"no deployment named {reference!r}; use `list` to see exact names"
+            )
+        if len(matches) > 1:
+            ids = ", ".join(sorted(matches))
+            raise AmbiguousDeploymentError(
+                f"deployment name {reference!r} is ambiguous; matching IDs: {ids}"
+            )
+        return next(iter(matches))
+
+    def get(self, reference: str) -> Any:
+        deployment_id = self.resolve_id(reference)
         return self._client.get_model_deployment(deployment_id=deployment_id)
 
-    def status(self, deployment_id: str) -> dict[str, Any]:
+    def status(self, reference: str) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
+        detail = self._client.get_model_deployment(deployment_id=deployment_id)
+        deployment = (
+            {
+                "deployment_id": deployment_id,
+                "deployment_name": detail.get("deployment_name") or detail.get("name"),
+                "status": detail.get("status") or detail.get("deployment_status"),
+                "model_repo": detail.get("model_repo"),
+                "accelerator_type": detail.get("accelerator_type"),
+                "min_pod_replicas": detail.get("min_pod_replicas"),
+                "max_pod_replicas": detail.get("max_pod_replicas"),
+                "updated_at": detail.get("updated_at"),
+            }
+            if isinstance(detail, dict)
+            else {"deployment_id": deployment_id}
+        )
         return {
-            "deployment": self.get(deployment_id),
-            "health": self.health(deployment_id),
+            "deployment": deployment,
+            "health": self._client.fetch_deployment_health(
+                deployment_id=deployment_id
+            ),
         }
 
-    def start(self, deployment_id: str, *, org_id: str | None = None) -> dict[str, Any]:
-        detail = self.get(deployment_id)
+    def start(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
+        detail = self._client.get_model_deployment(deployment_id=deployment_id)
         status = self._deployment_status(detail)
         if status in {"DEPLOYED", "PENDING"}:
             return self._unchanged(deployment_id, status)
@@ -73,8 +137,9 @@ class DeploymentManager:
         )
         return self._changed(deployment_id, "start", result)
 
-    def stop(self, deployment_id: str, *, org_id: str | None = None) -> dict[str, Any]:
-        detail = self.get(deployment_id)
+    def stop(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
+        detail = self._client.get_model_deployment(deployment_id=deployment_id)
         status = self._deployment_status(detail)
         if status == "STOPPED":
             return self._unchanged(deployment_id, status)
@@ -87,16 +152,19 @@ class DeploymentManager:
 
     def restart(
         self,
-        deployment_id: str,
+        reference: str,
         *,
         namespace: str | None = None,
         org_id: str | None = None,
     ) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
         resolved_org_id = org_id or self._settings.org_id
         resolved_namespace = namespace or self._settings.deployment_namespace
 
         if not resolved_org_id or not resolved_namespace:
-            detail = self.get(deployment_id)
+            detail = self._client.get_model_deployment(
+                deployment_id=deployment_id
+            )
             resolved_org_id = resolved_org_id or self._org_id(detail)
             resolved_namespace = resolved_namespace or self._namespace(detail)
 
@@ -116,12 +184,13 @@ class DeploymentManager:
         )
         return self._changed(deployment_id, "restart", result)
 
-    def health(self, deployment_id: str) -> Any:
+    def health(self, reference: str) -> Any:
+        deployment_id = self.resolve_id(reference)
         return self._client.fetch_deployment_health(deployment_id=deployment_id)
 
     def wait_for_status(
         self,
-        deployment_id: str,
+        reference: str,
         *,
         target_status: str,
         require_healthy: bool,
@@ -133,13 +202,16 @@ class DeploymentManager:
             raise ValueError("wait timeout must be greater than zero")
         if poll_interval <= 0:
             raise ValueError("poll interval must be greater than zero")
+        deployment_id = self.resolve_id(reference)
         target_status = target_status.upper()
         deadline = self._clock() + timeout
         last_status: str | None = None
         last_health: str | None = None
 
         while True:
-            detail = self.get(deployment_id)
+            detail = self._client.get_model_deployment(
+                deployment_id=deployment_id
+            )
             last_status = self._deployment_status(detail)
             health: Any = None
 
@@ -151,7 +223,9 @@ class DeploymentManager:
             if last_status == target_status:
                 if not require_healthy:
                     return {"deployment": detail, "health": None}
-                health = self.health(deployment_id)
+                health = self._client.fetch_deployment_health(
+                    deployment_id=deployment_id
+                )
                 last_health = self._health_status(health)
                 if last_health == "HEALTHY":
                     return {"deployment": detail, "health": health}
@@ -174,7 +248,7 @@ class DeploymentManager:
 
     def set_schedule(
         self,
-        deployment_id: str,
+        reference: str,
         *,
         timezone: str,
         start: str,
@@ -182,6 +256,7 @@ class DeploymentManager:
         desired_replicas: int,
         max_replicas: int,
     ) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
         rule = CronScalingRule(
             timezone=timezone,
             start=start,
@@ -199,11 +274,12 @@ class DeploymentManager:
 
     def clear_schedule(
         self,
-        deployment_id: str,
+        reference: str,
         *,
         min_replicas: int,
         max_replicas: int,
     ) -> dict[str, Any]:
+        deployment_id = self.resolve_id(reference)
         result = self._client.update_deployment_autoscaling(
             deployment_id=deployment_id,
             min_replicas=min_replicas,
@@ -226,6 +302,14 @@ class DeploymentManager:
             return None
         status = health.get("data") or health.get("status")
         return str(status).upper() if status is not None else None
+
+    @staticmethod
+    def _result_rows(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            return [row for row in data["results"] if isinstance(row, dict)]
+        return []
 
     @classmethod
     def _org_id(cls, detail: Any) -> str | None:

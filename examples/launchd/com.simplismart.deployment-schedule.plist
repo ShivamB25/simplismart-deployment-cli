@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.simplismart.deployment-schedule</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/simplismart-deployment-cli/.venv/bin/simplismart-deploy</string>
+    <string>schedule</string>
+    <string>run</string>
+    <string>nightly-inference</string>
+    <string>--on-at</string>
+    <string>10am</string>
+    <string>--off-at</string>
+    <string>1am</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/opt/simplismart-deployment-cli</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/simplismart-deployment-schedule.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/simplismart-deployment-schedule.error.log</string>
+</dict>
+</plist>

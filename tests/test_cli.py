@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from typer.testing import CliRunner
 
@@ -16,10 +19,26 @@ class FakeManager:
     def list(self, **kwargs: Any) -> list[dict[str, str]]:
         return [{"deployment_id": "deployment-1", "status": "DEPLOYED"}]
 
+    def get(self, deployment_id: str) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "env_variables": {"PRIVATE_API_KEY": "super-secret-value"},
+            "nested": {"access_token": "another-secret"},
+            "status": "DEPLOYED",
+        }
+
     def start(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
         return {
             "deployment_id": deployment_id,
             "action": "start",
+            "changed": True,
+            "result": {"accepted": True},
+        }
+
+    def stop(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "action": "stop",
             "changed": True,
             "result": {"accepted": True},
         }
@@ -31,6 +50,14 @@ class FakeManager:
         return {
             "deployment": {"deployment_id": deployment_id, "status": "DEPLOYED"},
             "health": {"data": "Healthy"},
+        }
+
+    def set_schedule(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "action": "schedule_set",
+            "changed": True,
+            "result": kwargs,
         }
 
 
@@ -137,3 +164,135 @@ def test_empty_token_has_actionable_configuration_error() -> None:
 
     assert result.exit_code == cli.EXIT_CONFIG
     assert "SIMPLISMART_PG_TOKEN must not be empty" in result.stderr
+
+
+def test_daily_schedule_accepts_name_and_human_local_times(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule",
+            "daily",
+            "nightly-inference",
+            "--on-at",
+            "10am",
+            "--off-at",
+            "1am",
+            "--timezone",
+            "Asia/Kolkata",
+        ],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert '\"deployment_id\": \"nightly-inference\"' in result.stdout
+    assert '\"start\": \"0 10 * * *\"' in result.stdout
+    assert '\"end\": \"0 1 * * *\"' in result.stdout
+    assert '\"crosses_midnight\": true' in result.stdout
+
+
+def test_foreground_schedule_retries_transient_failure(monkeypatch: Any) -> None:
+    attempts = 0
+
+    def fake_execute(ctx: Any, operation: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise cli.typer.Exit(cli.EXIT_API)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_execute", fake_execute)
+    monkeypatch.setattr(cli, "sleep", lambda seconds: None)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule",
+            "run",
+            "nightly-inference",
+            "--on-at",
+            "10am",
+            "--off-at",
+            "1am",
+            "--timezone",
+            "UTC",
+        ],
+    )
+
+    assert result.exit_code == 130
+    assert attempts == 2
+    assert "Retrying reconciliation" in result.stderr
+
+
+def test_foreground_schedule_streams_compact_jsonl(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
+
+    def stop_after_first_event(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "sleep", stop_after_first_event)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "schedule",
+            "run",
+            "nightly-inference",
+            "--on-at",
+            "10am",
+            "--off-at",
+            "1am",
+            "--timezone",
+            "UTC",
+            "--no-wait",
+        ],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    lines = result.stdout.splitlines()
+    assert result.exit_code == 130
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["deployment_id"] == "nightly-inference"
+    assert event["desired_state"] in {"DEPLOYED", "STOPPED"}
+
+
+def test_scheduler_sleep_rechecks_wall_clock_after_wake() -> None:
+    timezone = ZoneInfo("UTC")
+    window = cli.DailyWindow.create(
+        on_at="10:00",
+        off_at="11:00",
+        timezone_name="UTC",
+    )
+    observed_times = iter(
+        (
+            datetime(2026, 7, 14, 10, 0, tzinfo=timezone),
+            datetime(2026, 7, 14, 11, 30, tzinfo=timezone),
+        )
+    )
+    sleeps: list[float] = []
+
+    cli._sleep_until(
+        datetime(2026, 7, 14, 11, 0, tzinfo=timezone),
+        window,
+        clock=lambda: next(observed_times),
+        sleeper=sleeps.append,
+    )
+
+    assert sleeps == [cli.SCHEDULE_SLEEP_CHUNK_SECONDS]
+
+
+def test_sensitive_sdk_fields_are_redacted_from_output(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
+
+    result = runner.invoke(
+        cli.app,
+        ["get", "nightly-inference"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert "super-secret-value" not in result.stdout
+    assert "another-secret" not in result.stdout
+    assert result.stdout.count("<redacted>") == 2

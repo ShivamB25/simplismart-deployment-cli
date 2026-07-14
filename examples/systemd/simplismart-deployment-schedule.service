@@ -1,0 +1,15 @@
+[Unit]
+Description=Simplismart deployment daily lifecycle schedule
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/simplismart-deployment-cli
+EnvironmentFile=/opt/simplismart-deployment-cli/.env
+ExecStart=/opt/simplismart-deployment-cli/.venv/bin/simplismart-deploy schedule run nightly-inference --on-at 10am --off-at 1am
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
