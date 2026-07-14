@@ -1,11 +1,11 @@
 # Simplismart Deployment CLI
 
-A community-built, one-shot, automation-safe CLI around the
+A community-built, interactive and automation-safe CLI around the
 [Simplismart Python SDK](https://docs.simplismart.ai/sdk/python/overview).
-It manages deployment lifecycle operations and native Simplismart cron
-scaling without keeping a Python scheduler process alive.
+It supports one-shot lifecycle commands, a foreground daily start/stop loop,
+and durable native Simplismart cron scaling.
 
-## Why a one-shot CLI
+## Why this CLI
 
 - `start` treats `DEPLOYED` and the in-flight `PENDING` state as successful
   no-ops; `stop` is a no-op when already `STOPPED`. Repeated cron or Kubernetes
