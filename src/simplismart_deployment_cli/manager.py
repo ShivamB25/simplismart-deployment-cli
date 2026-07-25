@@ -150,6 +150,20 @@ class DeploymentManager:
         )
         return self._changed(deployment_id, "stop", result)
 
+    def delete(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
+        """Delete a deployment through the current organization-scoped SDK API."""
+        deployment_id = self.resolve_id(reference)
+        resolved_org_id = org_id or self._settings.org_id
+        if not resolved_org_id:
+            raise ValueError("delete needs an organization; set ORG_ID or pass --org-id")
+
+        result = self._client.delete_deployment(
+            deployment_id=deployment_id,
+            org_id=resolved_org_id,
+        )
+        return self._changed(deployment_id, "delete", result)
+
+
     def restart(
         self,
         reference: str,

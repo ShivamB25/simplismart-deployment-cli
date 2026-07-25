@@ -270,6 +270,21 @@ def stop(
 
 
 @app.command()
+def delete(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+    org_id: Annotated[str | None, typer.Option("--org-id")] = None,
+) -> None:
+    """Delete a deployment through the organization-scoped SDK endpoint."""
+    _execute(
+        ctx,
+        lambda manager: manager.delete(deployment_id, org_id=org_id),
+    )
+
+
+
+
+@app.command()
 def restart(
     ctx: typer.Context,
     deployment_id: DeploymentReference,

@@ -42,6 +42,10 @@ class FakeClient:
         self.calls.append(("restart", kwargs))
         return {"accepted": "restart"}
 
+    def delete_deployment(self, **kwargs: Any) -> dict[str, str]:
+        self.calls.append(("delete", kwargs))
+        return {"accepted": "delete"}
+
     def update_deployment_autoscaling(self, **kwargs: Any) -> dict[str, bool]:
         self.calls.append(("autoscaling", kwargs))
         return {"accepted": True}
@@ -122,6 +126,24 @@ def test_stop_is_idempotent_when_already_stopped() -> None:
 
     assert result["changed"] is False
     assert client.calls == [("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})]
+
+
+def test_delete_uses_current_org_scoped_sdk_endpoint() -> None:
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient({"status": "DEPLOYED"})
+    manager = DeploymentManager(settings(), client=client)
+
+    result = manager.delete(deployment_id)
+
+    assert result == {
+        "deployment_id": deployment_id,
+        "action": "delete",
+        "changed": True,
+        "result": {"accepted": "delete"},
+    }
+    assert client.calls == [
+        ("delete", {"deployment_id": deployment_id, "org_id": "org-1"}),
+    ]
 
 
 def test_schedule_uses_native_cron_scaling_and_zero_minimum() -> None:

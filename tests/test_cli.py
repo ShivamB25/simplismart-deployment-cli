@@ -43,6 +43,14 @@ class FakeManager:
             "result": {"accepted": True},
         }
 
+    def delete(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "action": "delete",
+            "changed": True,
+            "result": {"accepted": True, **kwargs},
+        }
+
     def health(self, deployment_id: str) -> dict[str, str]:
         return {"data": "Progressing", "deployment_id": deployment_id}
 
@@ -73,6 +81,19 @@ def test_list_emits_machine_readable_json(monkeypatch: Any) -> None:
     assert result.exit_code == 0
     assert '"deployment_id": "deployment-1"' in result.stdout
     assert '"status": "DEPLOYED"' in result.stdout
+
+def test_delete_command_uses_manager_delete(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
+
+    result = runner.invoke(
+        cli.app,
+        ["delete", "deployment-1", "--org-id", "org-1"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert '"action": "delete"' in result.stdout
+    assert '"org_id": "org-1"' in result.stdout
 
 
 def test_health_gate_has_distinct_unhealthy_exit_code(monkeypatch: Any) -> None:

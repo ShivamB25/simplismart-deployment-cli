@@ -65,6 +65,7 @@ uv run simplismart-deploy start DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy stop DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy restart DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy delete DEPLOYMENT_NAME_OR_UUID --org-id "$ORG_ID"
 
 # Force either format; SIMPLISMART_OUTPUT can set the same preference
 uv run simplismart-deploy --output table list
@@ -81,6 +82,12 @@ uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID --wait --wait-timeout 9
 ```
 
 Every deployment argument accepts either a UUID or an exact deployment name.
+
+`delete` uses the current organization-scoped Simplismart API endpoint and
+requires `ORG_ID` (from the environment or `--org-id`). Do not use the legacy
+`delete_model_deployment` SDK method. Before deleting a deployment, inspect its
+exact ID and status; after deletion, verify the terminal state and resource
+allocation before creating a replacement.
 Names must be unique; ambiguous names fail without changing either deployment.
 `ORG_ID` is used when the API requires it. `restart` also needs the Kubernetes
 namespace, resolved from command options, environment configuration, or
