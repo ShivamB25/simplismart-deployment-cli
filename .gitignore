@@ -18,3 +18,14 @@ wheels/
 .serena/
 results/**
 .DS_Store
+
+# Test, lint, and downloaded platform artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+logs-deployment-*.txt
+
+# Optional local clone; do not modify or commit vendored benchmark source.
+vendor/

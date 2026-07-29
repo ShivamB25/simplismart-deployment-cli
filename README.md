@@ -53,6 +53,18 @@ uv run simplismart-deploy --help
 After installing the package, use `simplismart-deploy` or its short alias,
 `ssdeploy`.
 
+## Repository layout
+
+- `src/simplismart_deployment_cli/` — packaged CLI and lifecycle logic.
+- `deployments/<model>/` — checked-in BYOC manifests. These are consumed by
+  this repository's CLI; they are not dashboard-upload documents.
+- `scripts/benchmarks/` — endpoint benchmark clients.
+- `scripts/local/` — local-only launchers, never Simplismart deployment inputs.
+- `results/` — ignored benchmark output and investigation artifacts.
+- `vendor/` — ignored local clones of third-party benchmark source.
+
+Root files contain only package, contributor, and repository configuration.
+
 ## Deployment commands
 
 ```bash
@@ -79,7 +91,35 @@ uv run simplismart-deploy restart DEPLOYMENT_NAME_OR_UUID --wait --wait-timeout 
 # Readiness gates for scripts and Kubernetes probes
 uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID --require-healthy
 uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID --wait --wait-timeout 900
+
+# Deploy a checked-in BYOC manifest. --wait is enabled by default and waits for
+# both DEPLOYED status and /health readiness.
+uv run simplismart-deploy deploy \
+  deployments/gemma-4-31b-it/vllm-qat.yaml \
+  --wait-timeout 1800
+
+# Submit without waiting only when another process will verify health.
+uv run simplismart-deploy deploy deployments/qwen3.6-35b-a3b-fp8/sglang-simple.yaml --no-wait
 ```
+
+### Deployment profiles
+
+Every vLLM profile pins `vllm/vllm-openai:v0.26.0-cu129`. Changing a vLLM
+image also requires a new versioned `modelRepository` name; the deploy command
+will refuse to reuse a repository whose image does not match.
+
+`gemma-4-31b-it/vllm-qat.yaml` is the reference Gemma QAT profile:
+
+- 1× H100, 32K combined prompt-plus-output context, 94% GPU memory target.
+- Uses the model tokenizer's bundled chat template. Do not add
+  `--chat-template examples/tool_chat_template_gemma4.jinja` or
+  `--default-chat-template-kwargs`: that repository-relative template is not
+  present in the pinned vLLM image.
+- Uses `gemma4` reasoning and tool-call parsers. Validate them with a forced
+  tool call after every parser or image change.
+
+SGLang profiles remain separate engine choices. Benchmark the intended
+concurrency and context mix before raising profile limits.
 
 Every deployment argument accepts either a UUID or an exact deployment name.
 
