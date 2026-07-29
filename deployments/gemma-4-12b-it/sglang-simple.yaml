@@ -1,0 +1,68 @@
+# Simplismart BYOC manifest consumed by `simplismart-deploy deploy`.
+# The CLI resolves deployment.modelRepoName to a ModelRepo UUID before creation.
+# Credentials are injected from the environment or ignored .env file.
+#
+# Prefix caching: SGLang RadixAttention is ENABLED by default.
+# Do NOT pass --disable-radix-cache. Eviction policy set explicitly to lru.
+# Shared benchmark key is set as env so it is visible in the Simplismart UI.
+# Engine auth uses SGLang --api-key (literal argv value; not shell-expanded).
+# Simplismart gateway auth is disabled so clients only need this one key.
+# Gemma 4 requires an SGLang image with Gemma4 parser support (not plain v0.5.15).
+# Use HF_TOKEN for Hugging Face model downloads.
+apiVersion: simplismart.ai/byoc/v1alpha1
+metadata:
+  name: zapim-gemma4-12b-it-sglang-simple
+  model: google/gemma-4-12B-it
+modelRepository:
+  name: gemma4-12b-it-sglang-gemma4
+  sourceType: docker_hub
+  registryPath: lmsysorg/sglang
+  dockerTag: gemma4
+  runtimeGpus: 1
+  healthcheck: &healthcheck
+    path: /health
+    port: 8000
+    initialDelaySeconds: 600
+    periodSeconds: 10
+    timeoutSeconds: 5
+  ports: &ports
+    http:
+      port: 8000
+  metricsPath: &metricsPath
+    - /v1/chat/completions
+  env: &env
+    BENCHMARK_API_KEY: ${BENCHMARK_API_KEY}
+    # Model-download credentials are injected from .env or platform secrets.
+    # Do not commit a live token here.
+    HF_TOKEN: ${HF_TOKEN}
+  deploymentCustomConfiguration: &command
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - google/gemma-4-12B-it
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reasoning-parser
+      - gemma4
+      - --tool-call-parser
+      - gemma4
+      - --radix-eviction-policy
+      - lru
+      - --api-key
+      - ${BENCHMARK_API_KEY}
+deployment:
+  name: zapim-gemma4-12b-it-sglang-simple
+  modelRepoName: gemma4-12b-it-sglang-gemma4
+  gpuId: nvidia-h100
+  minPodReplicas: 1
+  maxPodReplicas: 1
+  authEnabled: false
+  envVariables: *env
+  healthcheck: *healthcheck
+  ports: *ports
+  metricsPath: *metricsPath
+  deploymentCustomConfiguration: *command

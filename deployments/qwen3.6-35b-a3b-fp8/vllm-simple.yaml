@@ -1,0 +1,55 @@
+# Simplismart BYOC manifest consumed by `simplismart-deploy deploy`.
+# The CLI resolves deployment.modelRepoName to a ModelRepo UUID before creation.
+# Shared benchmark key is set as env so it is visible in the Simplismart UI.
+# vLLM auth uses native VLLM_API_KEY (same value as BENCHMARK_API_KEY).
+# Simplismart gateway auth is disabled so clients only need this one key.
+# This profile was not redeployed in the latest run; apply on next recreation.
+# vLLM 0.26.0 CUDA 12.9 base image.
+apiVersion: simplismart.ai/byoc/v1alpha1
+metadata:
+  name: zapim-qwen36-35b-a3b-fp8-vllm-simple
+  model: Qwen/Qwen3.6-35B-A3B-FP8
+modelRepository:
+  name: qwen36-35b-a3b-fp8-vllm-simple-v0-26-0
+  sourceType: docker_hub
+  registryPath: vllm/vllm-openai
+  dockerTag: v0.26.0-cu129
+  runtimeGpus: 1
+  healthcheck: &healthcheck
+    path: /health
+    port: 8000
+    initialDelaySeconds: 600
+    periodSeconds: 10
+    timeoutSeconds: 5
+  ports: &ports
+    http:
+      port: 8000
+  metricsPath: &metricsPath
+    - /v1/chat/completions
+  env: &env
+    BENCHMARK_API_KEY: ${BENCHMARK_API_KEY}
+    VLLM_API_KEY: ${BENCHMARK_API_KEY}
+  deploymentCustomConfiguration: &command
+    command:
+      - vllm
+      - serve
+      - Qwen/Qwen3.6-35B-A3B-FP8
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+deployment:
+  name: zapim-qwen36-35b-a3b-fp8-vllm-simple
+  modelRepoName: qwen36-35b-a3b-fp8-vllm-simple-v0-26-0
+  gpuId: nvidia-h100
+  minPodReplicas: 1
+  maxPodReplicas: 1
+  authEnabled: false
+  envVariables: *env
+  healthcheck: *healthcheck
+  ports: *ports
+  metricsPath: *metricsPath
+  deploymentCustomConfiguration: *command

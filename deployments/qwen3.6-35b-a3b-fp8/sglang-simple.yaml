@@ -1,0 +1,65 @@
+# Simplismart BYOC manifest consumed by `simplismart-deploy deploy`.
+# The CLI resolves deployment.modelRepoName to a ModelRepo UUID before creation.
+# Credentials are injected from the environment or ignored .env file.
+#
+# Prefix caching: SGLang RadixAttention is ENABLED by default.
+# Do NOT pass --disable-radix-cache.
+# Keep simple profile as control baseline: Radix cache ON by default.
+# Throughput-only flags (mamba-radix extra_buffer, page-size) live in sglang-throughput.yaml.
+# Shared benchmark key is also set as env so it is visible in the Simplismart UI.
+# Engine auth uses SGLang --api-key (literal argv value; not shell-expanded).
+# Simplismart gateway auth is disabled so clients only need this one key.
+apiVersion: simplismart.ai/byoc/v1alpha1
+metadata:
+  name: zapim-qwen36-35b-a3b-fp8-sglang-simple
+  model: Qwen/Qwen3.6-35B-A3B-FP8
+modelRepository:
+  name: qwen36-35b-a3b-fp8-sglang-simple
+  sourceType: docker_hub
+  registryPath: lmsysorg/sglang
+  dockerTag: v0.5.15
+  runtimeGpus: 1
+  healthcheck: &healthcheck
+    path: /health
+    port: 8000
+    initialDelaySeconds: 600
+    periodSeconds: 10
+    timeoutSeconds: 5
+  ports: &ports
+    http:
+      port: 8000
+  metricsPath: &metricsPath
+    - /v1/chat/completions
+  env: &env
+    BENCHMARK_API_KEY: ${BENCHMARK_API_KEY}
+  deploymentCustomConfiguration: &command
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - Qwen/Qwen3.6-35B-A3B-FP8
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reasoning-parser
+      - qwen3
+      - --tool-call-parser
+      - qwen3_coder
+      - --radix-eviction-policy
+      - lru
+      - --api-key
+      - ${BENCHMARK_API_KEY}
+deployment:
+  name: zapim-qwen36-35b-a3b-fp8-sglang-simple
+  modelRepoName: qwen36-35b-a3b-fp8-sglang-simple
+  gpuId: nvidia-h100
+  minPodReplicas: 1
+  maxPodReplicas: 1
+  authEnabled: false
+  envVariables: *env
+  healthcheck: *healthcheck
+  ports: *ports
+  metricsPath: *metricsPath
+  deploymentCustomConfiguration: *command

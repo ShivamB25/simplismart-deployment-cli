@@ -1,0 +1,110 @@
+# Simplismart BYOC manifest consumed by `simplismart-deploy deploy`.
+# The CLI resolves deployment.modelRepoName to a ModelRepo UUID before creation.
+# Credentials are injected from the environment or ignored .env file.
+#
+# PRIMARY PRODUCTION PROFILE
+# One NVIDIA H100, text-only OpenAI-compatible serving, many concurrent short/
+# medium requests, low TTFT, tool calling, and optional per-request thinking.
+#
+# Design choices:
+# - Official Gemma 4 31B W4A16 QAT checkpoint: substantially more free VRAM for
+#   KV cache and concurrency than the BF16 checkpoint.
+# - 8K total sequence ceiling (prompt + generated tokens): intentional for an
+#   interactive/voice/agent workload. Increase only when real requests need it.
+# - BF16/auto KV cache: do not switch Gemma 4 to FP8 KV without validation.
+# - No MTP/speculative decoding: prioritizes concurrency, TTFT, prefix-cache
+#   behavior, and reliable streamed tool calls over decode-only acceleration.
+# - No concurrent-partial-prefill flags: Gemma 4 rejected the old value of 2.
+#
+# Credentials are injected at provision time; never commit their values.
+apiVersion: simplismart.ai/byoc/v1alpha1
+metadata:
+  name: zapim-gemma4-31b-it-vllm-qat
+  model: google/gemma-4-31B-it-qat-w4a16-ct
+modelRepository:
+  name: gemma4-31b-it-qat-w4a16-ct-vllm-v0-26-0
+  sourceType: docker_hub
+  registryPath: vllm/vllm-openai
+  # Official stable vLLM 0.26.0 CUDA 12.9 image.
+  dockerTag: v0.26.0-cu129
+  runtimeGpus: 1
+  healthcheck: &healthcheck
+    path: /health
+    port: 8000
+    initialDelaySeconds: 900
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 300
+  ports: &ports
+    http:
+      port: 8000
+  metricsPath: &metricsPath
+    - /v1/chat/completions
+  env: &env
+    BENCHMARK_API_KEY: ${BENCHMARK_API_KEY}
+    VLLM_API_KEY: ${BENCHMARK_API_KEY}
+    HF_TOKEN: ${HF_TOKEN}
+  deploymentCustomConfiguration: &command
+    command:
+      - vllm
+      - serve
+      - google/gemma-4-31B-it-qat-w4a16-ct
+      # Keep the API-facing model name unchanged for existing clients.
+      - --served-model-name
+      - google/gemma-4-31B-it
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "1"
+      # This is prompt + output combined, not prompt-only.
+      - --max-model-len
+      - "32768"
+      # 0.94 is inside vLLM's recommended 0.90-0.95 range while retaining
+      # some non-vLLM GPU headroom.
+      - --gpu-memory-utilization
+      - "0.94"
+      # Scheduler ceilings; actual live concurrency is bounded by total KV
+      # tokens and request lengths.
+      - --max-num-seqs
+      - "128"
+      - --max-num-batched-tokens
+      - "32768"
+      - --enable-chunked-prefill
+      - --enable-prefix-caching
+      - --async-scheduling
+      # The workload is text-only. Avoid multimodal profiling and processor
+      # cache allocation while retaining Gemma tool/reasoning capabilities.
+      - --language-model-only
+      - --mm-processor-cache-gb
+      - "0"
+      # Parallelize tokenization and chat-template rendering for concurrent
+      # OpenAI API requests. Reduce to 2 only if the pod is CPU-constrained.
+      - --renderer-num-workers
+      - "4"
+      # Balanced is the right default between interactive latency and peak
+      # aggregate throughput; benchmark interactivity/throughput modes later.
+      - --performance-mode
+      - balanced
+      # Be explicit: preserve the model/activation dtype for KV cache rather
+      # than enabling the currently risky Gemma 4 FP8 KV path.
+      - --kv-cache-dtype
+      - auto
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - gemma4
+      - --reasoning-parser
+      - gemma4
+deployment:
+  name: zapim-gemma4-31b-it-vllm-qat
+  modelRepoName: gemma4-31b-it-qat-w4a16-ct-vllm-v0-26-0
+  gpuId: nvidia-h100
+  minPodReplicas: 1
+  maxPodReplicas: 1
+  authEnabled: false
+  envVariables: *env
+  healthcheck: *healthcheck
+  ports: *ports
+  metricsPath: *metricsPath
+  deploymentCustomConfiguration: *command

@@ -1,0 +1,72 @@
+# Simplismart BYOC manifest consumed by `simplismart-deploy deploy`.
+# The CLI resolves deployment.modelRepoName to a ModelRepo UUID before creation.
+# Credentials are injected from the environment or ignored .env file.
+#
+# Prefix caching: SGLang RadixAttention is enabled unless --disable-radix-cache
+# is passed. This profile uses an explicit LRU eviction policy.
+# Inject BENCHMARK_API_KEY and HF_* values from ignored environment files or
+# platform secrets; do not commit their real values.
+apiVersion: simplismart.ai/byoc/v1alpha1
+metadata:
+  name: zapim-gemma4-26b-a4b-it-sglang-prefix-v2
+  model: google/gemma-4-26B-A4B-it
+modelRepository:
+  name: gemma4-sglang-gemma4
+  sourceType: docker_hub
+  registryPath: lmsysorg/sglang
+  dockerTag: gemma4
+  runtimeGpus: 1
+  healthcheck: &healthcheck
+    path: /health
+    port: 8000
+    initialDelaySeconds: 900
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 300
+  ports: &ports
+    http:
+      port: 8000
+  metricsPath: &metricsPath
+    - /v1/chat/completions
+  env: &env
+    BENCHMARK_API_KEY: ${BENCHMARK_API_KEY}
+    HF_TOKEN: ${HF_TOKEN}
+  deploymentCustomConfiguration: &command
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - google/gemma-4-26B-A4B-it
+      - --served-model-name
+      - google/gemma-4-26B-A4B-it
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tp
+      - "1"
+      - --context-length
+      - "32768"
+      - --mem-fraction-static
+      - "0.80"
+      - --radix-eviction-policy
+      - lru
+      - --reasoning-parser
+      - gemma4
+      - --tool-call-parser
+      - gemma4
+      - --api-key
+      - ${BENCHMARK_API_KEY}
+deployment:
+  name: zapim-gemma4-26b-a4b-it-sglang-prefix-v2
+  modelRepoName: gemma4-sglang-gemma4
+  gpuId: nvidia-h100
+  minPodReplicas: 1
+  maxPodReplicas: 1
+  authEnabled: false
+  envVariables: *env
+  healthcheck: *healthcheck
+  ports: *ports
+  metricsPath: *metricsPath
+  deploymentCustomConfiguration: *command
