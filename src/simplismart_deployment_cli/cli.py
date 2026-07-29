@@ -8,7 +8,7 @@ from enum import Enum
 from importlib.metadata import version
 from math import ceil
 from time import sleep
-from typing import Any, Annotated
+from typing import Annotated, Any
 
 import typer
 from pydantic import ValidationError
@@ -22,8 +22,8 @@ from .manager import (
     DeploymentNotFoundError,
     DeploymentWaitError,
 )
-from .settings import Settings
 from .scheduling import DailyWindow, local_timezone_name
+from .settings import Settings
 
 EXIT_CONFIG = 2
 EXIT_AUTH = 3
@@ -187,6 +187,51 @@ def list_deployments(
     )
 
 
+
+@app.command("deploy")
+def deploy_manifest(
+    ctx: typer.Context,
+    manifest: Annotated[
+        str,
+        typer.Argument(
+            metavar="MANIFEST",
+            help="Path to a simplismart.ai/byoc/v1alpha1 YAML manifest.",
+        ),
+    ],
+    wait: Annotated[
+        bool,
+        typer.Option(
+            "--wait/--no-wait",
+            help="Wait until the deployment is DEPLOYED and Healthy.",
+        ),
+    ] = True,
+    wait_timeout: Annotated[
+        float,
+        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+    ] = 1800,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+    ] = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Create or resume the deployment declared in a checked-in BYOC manifest."""
+    _execute(
+        ctx,
+        lambda manager: _lifecycle_result(
+            ctx,
+            manager,
+            action=lambda: manager.deploy_manifest(manifest),
+            deployment_id=None,
+            target_status="DEPLOYED",
+            require_healthy=True,
+            wait=wait,
+            wait_timeout=wait_timeout,
+            poll_interval=poll_interval,
+        ),
+    )
+
+
+
 @app.command("get")
 def get_deployment(ctx: typer.Context, deployment_id: DeploymentReference) -> None:
     """Show the complete deployment record."""
@@ -267,7 +312,6 @@ def stop(
             poll_interval=poll_interval,
         ),
     )
-
 
 @app.command()
 def delete(
@@ -747,7 +791,7 @@ def _lifecycle_result(
     manager: DeploymentManager,
     *,
     action: Callable[[], dict[str, Any]],
-    deployment_id: str,
+    deployment_id: str | None,
     target_status: str,
     require_healthy: bool,
     wait: bool,
@@ -755,11 +799,14 @@ def _lifecycle_result(
     poll_interval: float,
 ) -> dict[str, Any]:
     result = action()
+    resolved_deployment_id = deployment_id or result.get("deployment_id")
+    if not isinstance(resolved_deployment_id, str) or not resolved_deployment_id:
+        raise RuntimeError("deployment action did not return a deployment ID")
     if wait:
         result["final_state"] = _wait_for_status(
             ctx,
             manager,
-            deployment_id=deployment_id,
+            deployment_id=resolved_deployment_id,
             target_status=target_status,
             require_healthy=require_healthy,
             wait_timeout=wait_timeout,

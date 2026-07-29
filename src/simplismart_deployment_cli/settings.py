@@ -19,6 +19,11 @@ class Settings(BaseSettings):
         validation_alias="SIMPLISMART_PG_TOKEN",
     )
     org_id: str | None = Field(default=None, validation_alias="ORG_ID")
+    benchmark_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="BENCHMARK_API_KEY",
+    )
+    hf_token: SecretStr | None = Field(default=None, validation_alias="HF_TOKEN")
     deployment_namespace: str | None = Field(
         default=None,
         validation_alias="SIMPLISMART_NAMESPACE",

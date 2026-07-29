@@ -51,6 +51,16 @@ class FakeManager:
             "result": {"accepted": True, **kwargs},
         }
 
+
+    def deploy_manifest(self, manifest: str) -> dict[str, Any]:
+        return {
+            "manifest": manifest,
+            "deployment_id": "manifest-deployment-1",
+            "model_repo_created": True,
+            "deployment_created": True,
+        }
+
+
     def health(self, deployment_id: str) -> dict[str, str]:
         return {"data": "Progressing", "deployment_id": deployment_id}
 
@@ -96,6 +106,9 @@ def test_delete_command_uses_manager_delete(monkeypatch: Any) -> None:
     assert '"org_id": "org-1"' in result.stdout
 
 
+
+
+
 def test_health_gate_has_distinct_unhealthy_exit_code(monkeypatch: Any) -> None:
     monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
 
@@ -107,6 +120,20 @@ def test_health_gate_has_distinct_unhealthy_exit_code(monkeypatch: Any) -> None:
 
     assert result.exit_code == cli.EXIT_UNHEALTHY
     assert '"data": "Progressing"' in result.stdout
+
+
+def test_deploy_manifest_waits_for_a_healthy_deployment(monkeypatch: Any) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
+
+    result = runner.invoke(
+        cli.app,
+        ["deploy", "deployments/qwen3.6-35b-a3b-fp8/sglang-simple.yaml"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token", "ORG_ID": "org-1"},
+    )
+
+    assert result.exit_code == 0
+    assert '"deployment_id": "manifest-deployment-1"' in result.stdout
+    assert '"final_state"' in result.stdout
 
 
 def test_invalid_status_is_a_usage_failure() -> None:

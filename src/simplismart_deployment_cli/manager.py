@@ -46,6 +46,119 @@ class DeploymentManager:
         self._clock = clock
         self._sleeper = sleeper
 
+    def deploy_manifest(self, path: str) -> dict[str, Any]:
+        """Create or resume the exact BYOC deployment declared in a YAML manifest."""
+        from .manifest import load_byoc_manifest
+
+        org_id = self._settings.org_id
+        if not org_id:
+            raise ValueError("ORG_ID is required to deploy a manifest")
+        manifest = load_byoc_manifest(path, org_id=org_id)
+        model_repo, model_repo_created = self._manifest_model_repo(manifest.model_repo)
+        model_repo_id = self._detail_value(model_repo, "uuid", "id")
+        if not model_repo_id:
+            raise RuntimeError("Simplismart did not return a model repository ID")
+        desired_deployment = manifest.deployment_payload(
+            org_id=org_id, model_repo_id=model_repo_id
+        )
+
+        active_matches = {
+            deployment_id: row
+            for deployment_id, row in self._deployments_named(manifest.deployment_name).items()
+            if self._deployment_status(row) != "DELETED"
+        }
+        if len(active_matches) > 1:
+            ids = ", ".join(sorted(active_matches))
+            raise AmbiguousDeploymentError(
+                "more than one non-deleted deployment is named "
+                f"{manifest.deployment_name!r}: {ids}"
+            )
+        if not active_matches:
+            deployment = self._client.create_deployment(desired_deployment)
+            deployment_id = self._detail_value(deployment, "deployment_id", "uuid", "id")
+            if not deployment_id:
+                raise RuntimeError("Simplismart did not return a deployment ID")
+            deployment_created = True
+        else:
+            deployment_id = next(iter(active_matches))
+            deployment = self._client.get_model_deployment(deployment_id=deployment_id)
+            if self._deployment_status(deployment) == "DELETED":
+                deployment = self._client.create_deployment(desired_deployment)
+                deployment_id = self._detail_value(
+                    deployment, "deployment_id", "uuid", "id"
+                )
+                if not deployment_id:
+                    raise RuntimeError("Simplismart did not return a deployment ID")
+                deployment_created = True
+            else:
+                existing_model_repo_id = self._detail_value(
+                    deployment, "model_repo", "model_repo_id"
+                )
+                if existing_model_repo_id and existing_model_repo_id != model_repo_id:
+                    raise ValueError(
+                        f"existing deployment {manifest.deployment_name!r} uses a different model repository"
+                    )
+                existing_command = deployment.get("deployment_custom_configuration")
+                if (
+                    existing_command is not None
+                    and existing_command
+                    != desired_deployment.deployment_custom_configuration
+                ):
+                    raise ValueError(
+                        f"existing deployment {manifest.deployment_name!r} has a different command; "
+                        "inspect its logs, then delete and recreate it explicitly"
+                    )
+                deployment = self.start(deployment_id, org_id=org_id)
+                deployment_created = False
+
+        return {
+            "manifest": str(manifest.path),
+            "model_repo": model_repo,
+            "deployment": deployment,
+            "deployment_id": deployment_id,
+            "model_repo_created": model_repo_created,
+            "deployment_created": deployment_created,
+        }
+
+    def _manifest_model_repo(self, desired_model_repo: Any) -> tuple[Any, bool]:
+        from simplismart import ModelRepoListParams
+
+        response = self._client.list_model_repos(
+            ModelRepoListParams(
+                org_id=desired_model_repo.org_id,
+                name=desired_model_repo.name,
+                count=20,
+            )
+        )
+        rows = self._result_rows(response)
+        matches = [
+            row
+            for row in rows
+            if isinstance(row, dict) and row.get("name") == desired_model_repo.name
+        ]
+        if len(matches) > 1:
+            raise AmbiguousDeploymentError(
+                f"multiple model repositories are named {desired_model_repo.name!r}"
+            )
+        if not matches:
+            return self._client.create_model_repo(desired_model_repo), True
+
+        model_repo = matches[0]
+        expected_image = (
+            f"{desired_model_repo.registry_path}:{desired_model_repo.docker_tag}"
+        )
+        byom = model_repo.get("byom")
+        actual_image = model_repo.get("source_url") or (
+            byom.get("image") if isinstance(byom, dict) else None
+        )
+        if actual_image != expected_image:
+            raise ValueError(
+                f"existing model repository {desired_model_repo.name!r} uses "
+                f"{actual_image!r}, expected {expected_image!r}"
+            )
+        return model_repo, False
+
+
     def list(
         self,
         *,
@@ -60,6 +173,23 @@ class DeploymentManager:
             offset=offset,
             count=count,
         )
+
+    def _deployments_named(self, name: str) -> dict[str, dict[str, Any]]:
+        """Return every deployment with an exact name, indexed by deployment ID."""
+        matches: dict[str, dict[str, Any]] = {}
+        offset = 0
+        page_size = 100
+        while True:
+            page = self.list(offset=offset, count=page_size)
+            rows = self._result_rows(page)
+            for row in rows:
+                row_name = row.get("deployment_name") or row.get("name")
+                deployment_id = self._detail_value(row, "deployment_id", "uuid", "id")
+                if row_name == name and deployment_id:
+                    matches[deployment_id] = row
+            if len(rows) < page_size:
+                return matches
+            offset += page_size
 
     def resolve_id(self, reference: str) -> str:
         """Resolve a deployment UUID or an exact, unique deployment name."""
@@ -149,7 +279,6 @@ class DeploymentManager:
             org_id=org_id or self._settings.org_id,
         )
         return self._changed(deployment_id, "stop", result)
-
     def delete(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
         """Delete a deployment through the current organization-scoped SDK API."""
         deployment_id = self.resolve_id(reference)

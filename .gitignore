@@ -17,3 +17,4 @@ wheels/
 # Local agent tooling
 .serena/
 results/**
+.DS_Store
