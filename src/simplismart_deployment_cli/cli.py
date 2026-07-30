@@ -70,6 +70,13 @@ DeploymentReference = Annotated[
         help="Exact deployment name or UUID.",
     ),
 ]
+DeploymentReferences = Annotated[
+    list[str],
+    typer.Argument(
+        metavar="DEPLOYMENT",
+        help="One or more exact deployment names or UUIDs.",
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -122,7 +129,9 @@ def configure(
     ] = None,
     timeout: Annotated[
         float | None,
-        typer.Option("--timeout", min=0.1, help="Override SIMPLISMART_TIMEOUT in seconds."),
+        typer.Option(
+            "--timeout", min=0.1, help="Override SIMPLISMART_TIMEOUT in seconds."
+        ),
     ] = None,
     version_flag: Annotated[
         bool,
@@ -190,6 +199,18 @@ def list_deployments(
     )
 
 
+@app.command()
+def manage(
+    ctx: typer.Context,
+    org_id: Annotated[str | None, typer.Option("--org-id")] = None,
+) -> None:
+    """Interactively inspect, start, and stop deployments."""
+    _execute(
+        ctx,
+        lambda manager: _manage_deployments(manager, org_id=org_id),
+        render=False,
+    )
+
 
 @app.command("deploy")
 def deploy_manifest(
@@ -214,7 +235,9 @@ def deploy_manifest(
     ] = 1800,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
     ] = DEFAULT_POLL_INTERVAL,
 ) -> None:
     """Create or resume the deployment declared in a checked-in BYOC manifest."""
@@ -234,41 +257,58 @@ def deploy_manifest(
     )
 
 
-
 @app.command("get")
-def get_deployment(ctx: typer.Context, deployment_id: DeploymentReference) -> None:
-    """Show the complete deployment record."""
-    _execute(ctx, lambda manager: manager.get(deployment_id))
+def get_deployment(ctx: typer.Context, deployment_ids: DeploymentReferences) -> None:
+    """Show complete deployment records."""
+    _execute_for_deployments(
+        ctx,
+        deployment_ids,
+        lambda manager, deployment_id: manager.get(deployment_id),
+    )
 
 
 @app.command()
-def status(ctx: typer.Context, deployment_id: DeploymentReference) -> None:
+def status(ctx: typer.Context, deployment_ids: DeploymentReferences) -> None:
     """Show deployment state and health together."""
-    _execute(ctx, lambda manager: manager.status(deployment_id))
+    _execute_for_deployments(
+        ctx,
+        deployment_ids,
+        lambda manager, deployment_id: manager.status(deployment_id),
+    )
 
 
 @app.command()
 def start(
     ctx: typer.Context,
-    deployment_id: DeploymentReference,
+    deployment_ids: DeploymentReferences,
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Wait until the deployment is DEPLOYED and Healthy."),
+        typer.Option(
+            "--wait",
+            help="Wait until every deployment is DEPLOYED and Healthy.",
+        ),
     ] = False,
     wait_timeout: Annotated[
         float,
-        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+        typer.Option(
+            "--wait-timeout",
+            min=1,
+            help="Maximum wait per deployment in seconds.",
+        ),
     ] = DEFAULT_WAIT_TIMEOUT,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
     ] = DEFAULT_POLL_INTERVAL,
 ) -> None:
-    """Start a deployment; safely no-op if it is already active."""
-    _execute(
+    """Start deployments; safely no-op for deployments that are already active."""
+    _execute_for_deployments(
         ctx,
-        lambda manager: _lifecycle_result(
+        deployment_ids,
+        lambda manager, deployment_id: _lifecycle_result(
             ctx,
             manager,
             action=lambda: manager.start(deployment_id, org_id=org_id),
@@ -285,25 +325,32 @@ def start(
 @app.command()
 def stop(
     ctx: typer.Context,
-    deployment_id: DeploymentReference,
+    deployment_ids: DeploymentReferences,
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Wait until the deployment is STOPPED."),
+        typer.Option("--wait", help="Wait until every deployment is STOPPED."),
     ] = False,
     wait_timeout: Annotated[
         float,
-        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+        typer.Option(
+            "--wait-timeout",
+            min=1,
+            help="Maximum wait per deployment in seconds.",
+        ),
     ] = DEFAULT_WAIT_TIMEOUT,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
     ] = DEFAULT_POLL_INTERVAL,
 ) -> None:
-    """Stop a deployment; safely no-op if it is already stopped."""
-    _execute(
+    """Stop deployments; safely no-op for deployments that are already stopped."""
+    _execute_for_deployments(
         ctx,
-        lambda manager: _lifecycle_result(
+        deployment_ids,
+        lambda manager, deployment_id: _lifecycle_result(
             ctx,
             manager,
             action=lambda: manager.stop(deployment_id, org_id=org_id),
@@ -316,25 +363,28 @@ def stop(
         ),
     )
 
+
 @app.command()
 def delete(
     ctx: typer.Context,
-    deployment_id: DeploymentReference,
+    deployment_ids: DeploymentReferences,
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
 ) -> None:
-    """Delete a deployment through the organization-scoped SDK endpoint."""
-    _execute(
+    """Delete deployments through the organization-scoped SDK endpoint."""
+    _execute_for_deployments(
         ctx,
-        lambda manager: manager.delete(deployment_id, org_id=org_id),
+        deployment_ids,
+        lambda manager, deployment_id: manager.delete(
+            deployment_id,
+            org_id=org_id,
+        ),
     )
-
-
 
 
 @app.command()
 def restart(
     ctx: typer.Context,
-    deployment_id: DeploymentReference,
+    deployment_ids: DeploymentReferences,
     namespace: Annotated[
         str | None,
         typer.Option(
@@ -345,21 +395,31 @@ def restart(
     org_id: Annotated[str | None, typer.Option("--org-id")] = None,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Wait until the deployment is DEPLOYED and Healthy."),
+        typer.Option(
+            "--wait",
+            help="Wait until every deployment is DEPLOYED and Healthy.",
+        ),
     ] = False,
     wait_timeout: Annotated[
         float,
-        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+        typer.Option(
+            "--wait-timeout",
+            min=1,
+            help="Maximum wait per deployment in seconds.",
+        ),
     ] = DEFAULT_WAIT_TIMEOUT,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
     ] = DEFAULT_POLL_INTERVAL,
 ) -> None:
-    """Restart a deployment. This operation is intentionally not idempotent."""
-    _execute(
+    """Restart deployments. This operation is intentionally not idempotent."""
+    _execute_for_deployments(
         ctx,
-        lambda manager: _lifecycle_result(
+        deployment_ids,
+        lambda manager, deployment_id: _lifecycle_result(
             ctx,
             manager,
             action=lambda: manager.restart(
@@ -380,29 +440,41 @@ def restart(
 @app.command()
 def health(
     ctx: typer.Context,
-    deployment_id: DeploymentReference,
+    deployment_ids: DeploymentReferences,
     require_healthy: Annotated[
         bool,
-        typer.Option(help=f"Exit {EXIT_UNHEALTHY} unless Simplismart reports Healthy."),
+        typer.Option(
+            help=f"Exit {EXIT_UNHEALTHY} unless every deployment reports Healthy."
+        ),
     ] = False,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Wait until the deployment is DEPLOYED and Healthy."),
+        typer.Option(
+            "--wait",
+            help="Wait until every deployment is DEPLOYED and Healthy.",
+        ),
     ] = False,
     wait_timeout: Annotated[
         float,
-        typer.Option("--wait-timeout", min=1, help="Maximum wait in seconds."),
+        typer.Option(
+            "--wait-timeout",
+            min=1,
+            help="Maximum wait per deployment in seconds.",
+        ),
     ] = DEFAULT_WAIT_TIMEOUT,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.1, help="Status polling interval in seconds."),
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
     ] = DEFAULT_POLL_INTERVAL,
 ) -> None:
     """Report deployment health, optionally waiting for readiness."""
     if wait:
-        _execute(
+        _execute_for_deployments(
             ctx,
-            lambda manager: _wait_for_status(
+            deployment_ids,
+            lambda manager, deployment_id: _wait_for_status(
                 ctx,
                 manager,
                 deployment_id=deployment_id,
@@ -414,8 +486,15 @@ def health(
         )
         return
 
-    result = _execute(ctx, lambda manager: manager.health(deployment_id))
-    if require_healthy and _health_status(result) != HEALTHY_STATUS:
+    result = _execute_for_deployments(
+        ctx,
+        deployment_ids,
+        lambda manager, deployment_id: manager.health(deployment_id),
+    )
+    results = result if len(deployment_ids) > 1 else [result]
+    if require_healthy and any(
+        _health_status(item) != HEALTHY_STATUS for item in results
+    ):
         raise typer.Exit(EXIT_UNHEALTHY)
 
 
@@ -423,7 +502,9 @@ def health(
 def set_schedule(
     ctx: typer.Context,
     deployment_id: DeploymentReference,
-    start: Annotated[str, typer.Option("--start", help="Cron expression for window start.")],
+    start: Annotated[
+        str, typer.Option("--start", help="Cron expression for window start.")
+    ],
     end: Annotated[str, typer.Option("--end", help="Cron expression for window end.")],
     timezone: Annotated[
         str | None,
@@ -617,8 +698,7 @@ def run_schedule(
                 if exc.exit_code not in RETRYABLE_SCHEDULE_EXIT_CODES:
                     raise
                 until_boundary = (
-                    boundary.timestamp()
-                    - datetime.now(window.timezone).timestamp()
+                    boundary.timestamp() - datetime.now(window.timezone).timestamp()
                 )
                 retry_in = max(
                     min(SCHEDULE_RETRY_SECONDS, until_boundary),
@@ -630,10 +710,7 @@ def run_schedule(
                 sleep(retry_in)
                 continue
 
-            remaining = (
-                boundary.timestamp()
-                - datetime.now(window.timezone).timestamp()
-            )
+            remaining = boundary.timestamp() - datetime.now(window.timezone).timestamp()
             if error_console.is_terminal:
                 error_console.print(
                     f"[dim]Next reconciliation: {boundary.isoformat()} "
@@ -712,9 +789,7 @@ def _schedule_view(
         "min_pod_replicas": detail.get("min_pod_replicas"),
         "max_pod_replicas": detail.get("max_pod_replicas"),
         "autoscale_config": (
-            detail.get("autoscale_config")
-            or detail.get("autoscaling_config")
-            or {}
+            detail.get("autoscale_config") or detail.get("autoscaling_config") or {}
         ),
     }
 
@@ -789,6 +864,22 @@ def _reconcile_window(
     return result
 
 
+def _execute_for_deployments(
+    ctx: typer.Context,
+    deployment_ids: list[str],
+    operation: Callable[[DeploymentManager, str], Any],
+) -> Any:
+    """Run one command per deployment while preserving single-target output."""
+
+    def execute(manager: DeploymentManager) -> Any:
+        results = [
+            operation(manager, deployment_id) for deployment_id in deployment_ids
+        ]
+        return results[0] if len(results) == 1 else results
+
+    return _execute(ctx, execute)
+
+
 def _lifecycle_result(
     ctx: typer.Context,
     manager: DeploymentManager,
@@ -855,11 +946,127 @@ def _wait_for_status(
     )
 
 
+def _manage_deployments(
+    manager: DeploymentManager,
+    *,
+    org_id: str | None,
+) -> None:
+    while True:
+        deployments = [
+            row
+            for row in manager.list()
+            if _deployment_row_id(row) and _deployment_row_status(row) != "DELETED"
+        ]
+        if not deployments:
+            console.print("[dim]No non-deleted deployments found.[/dim]")
+            return
+
+        _render_management_rows(deployments)
+        selection = typer.prompt(
+            "Select number(s), comma-separated; use 'all' or 'q' to quit"
+        ).strip()
+        if selection.lower() in {"q", "quit"}:
+            return
+
+        try:
+            indexes = _parse_deployment_selection(selection, len(deployments))
+        except ValueError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            continue
+
+        selected = [deployments[index] for index in indexes]
+        active = [
+            _deployment_row_status(row) in {"DEPLOYED", "PENDING"} for row in selected
+        ]
+        if all(active):
+            action = "stop"
+        elif not any(active):
+            action = "start"
+        else:
+            action = (
+                typer.prompt(
+                    "Selected deployments have mixed states; choose start or stop"
+                )
+                .strip()
+                .lower()
+            )
+            if action not in {"start", "stop"}:
+                console.print("[red]Action must be 'start' or 'stop'.[/red]")
+                continue
+
+        labels = ", ".join(_deployment_row_label(row) for row in selected)
+        if not typer.confirm(f"{action.title()} {labels}?", default=False):
+            continue
+
+        operation = manager.start if action == "start" else manager.stop
+        results = [
+            operation(_deployment_row_id(row) or "", org_id=org_id) for row in selected
+        ]
+        _render_rows(results)
+        console.print()
+
+
+def _render_management_rows(deployments: list[dict[str, Any]]) -> None:
+    table = Table(
+        title="Deployments",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("#", justify="right")
+    table.add_column("Deployment")
+    table.add_column("Status")
+    table.add_column("ID")
+    for index, row in enumerate(deployments, start=1):
+        table.add_row(
+            str(index),
+            _deployment_row_label(row),
+            _deployment_row_status(row),
+            _deployment_row_id(row) or "",
+        )
+    console.print(table)
+
+
+def _parse_deployment_selection(selection: str, count: int) -> list[int]:
+    if selection.lower() in {"all", "*"}:
+        return list(range(count))
+
+    indexes: list[int] = []
+    for value in selection.split(","):
+        try:
+            index = int(value.strip())
+        except ValueError as exc:
+            raise ValueError("selection must contain deployment numbers") from exc
+        if not 1 <= index <= count:
+            raise ValueError(f"deployment number must be between 1 and {count}")
+        zero_based = index - 1
+        if zero_based not in indexes:
+            indexes.append(zero_based)
+    if not indexes:
+        raise ValueError("select at least one deployment")
+    return indexes
+
+
+def _deployment_row_id(row: dict[str, Any]) -> str | None:
+    value = row.get("deployment_id") or row.get("uuid") or row.get("id")
+    return str(value) if value else None
+
+
+def _deployment_row_label(row: dict[str, Any]) -> str:
+    value = row.get("deployment_name") or row.get("name") or _deployment_row_id(row)
+    return str(value) if value else "unknown"
+
+
+def _deployment_row_status(row: dict[str, Any]) -> str:
+    value = row.get("status") or row.get("deployment_status") or "UNKNOWN"
+    return str(value).upper()
+
+
 def _execute(
     ctx: typer.Context,
     operation: Callable[[DeploymentManager], Any],
     *,
     stream: bool = False,
+    render: bool = True,
 ) -> Any:
     runtime = _runtime(ctx)
     try:
@@ -875,7 +1082,12 @@ def _execute(
             exit_code = EXIT_NOT_FOUND
         else:
             exit_code = EXIT_API
-        _fail(str(exc), exit_code, status_code=status_code, payload=getattr(exc, "payload", None))
+        _fail(
+            str(exc),
+            exit_code,
+            status_code=status_code,
+            payload=getattr(exc, "payload", None),
+        )
     except DeploymentNotFoundError as exc:
         _fail(str(exc), EXIT_NOT_FOUND)
     except DeploymentWaitError as exc:
@@ -890,7 +1102,7 @@ def _execute(
             json.dumps(_redact(result), default=str, separators=(",", ":")),
             flush=True,
         )
-    else:
+    elif render:
         _render(result, runtime.output)
     return result
 

@@ -96,9 +96,7 @@ def settings(org_id: str | None = "org-1") -> Settings:
 
 
 def test_list_returns_every_sdk_page_by_default() -> None:
-    deployments = [
-        {"deployment_id": f"deployment-{index}"} for index in range(42)
-    ]
+    deployments = [{"deployment_id": f"deployment-{index}"} for index in range(42)]
     client = FakeClient(deployments=deployments)
     manager = DeploymentManager(settings(), client=client)
 
@@ -109,9 +107,7 @@ def test_list_returns_every_sdk_page_by_default() -> None:
 
 
 def test_list_count_spans_the_sdk_page_cap() -> None:
-    deployments = [
-        {"deployment_id": f"deployment-{index}"} for index in range(30)
-    ]
+    deployments = [{"deployment_id": f"deployment-{index}"} for index in range(30)]
     client = FakeClient(deployments=deployments)
     manager = DeploymentManager(settings(), client=client)
 
@@ -132,7 +128,9 @@ def test_start_is_idempotent_when_already_deployed() -> None:
         "status": "DEPLOYED",
         "changed": False,
     }
-    assert client.calls == [("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})]
+    assert client.calls == [
+        ("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})
+    ]
 
 
 def test_start_is_idempotent_while_start_is_pending() -> None:
@@ -143,7 +141,9 @@ def test_start_is_idempotent_while_start_is_pending() -> None:
 
     assert result["status"] == "PENDING"
     assert result["changed"] is False
-    assert client.calls == [("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})]
+    assert client.calls == [
+        ("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})
+    ]
 
 
 def test_stop_is_idempotent_when_already_stopped() -> None:
@@ -153,7 +153,9 @@ def test_stop_is_idempotent_when_already_stopped() -> None:
     result = manager.stop("fc9318f7-1cfb-4e40-b14c-93c09b47205c")
 
     assert result["changed"] is False
-    assert client.calls == [("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})]
+    assert client.calls == [
+        ("get", {"deployment_id": "fc9318f7-1cfb-4e40-b14c-93c09b47205c"})
+    ]
 
 
 def test_delete_uses_current_org_scoped_sdk_endpoint() -> None:
@@ -204,7 +206,9 @@ def test_clear_schedule_sends_explicit_empty_cron_list() -> None:
     client = FakeClient()
     manager = DeploymentManager(settings(), client=client)
 
-    manager.clear_schedule("fc9318f7-1cfb-4e40-b14c-93c09b47205c", min_replicas=1, max_replicas=2)
+    manager.clear_schedule(
+        "fc9318f7-1cfb-4e40-b14c-93c09b47205c", min_replicas=1, max_replicas=2
+    )
 
     _, payload = client.calls[-1]
     assert payload["cron_scaling"] == []
@@ -217,7 +221,9 @@ def test_restart_requires_an_organization() -> None:
     manager = DeploymentManager(settings(org_id=None), client=client)
 
     with pytest.raises(ValueError, match="ORG_ID"):
-        manager.restart("fc9318f7-1cfb-4e40-b14c-93c09b47205c", namespace="model-serving")
+        manager.restart(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c", namespace="model-serving"
+        )
 
 
 def test_restart_infers_org_and_namespace_from_deployment() -> None:
@@ -322,6 +328,32 @@ def test_exact_deployment_name_resolves_for_lifecycle_action() -> None:
         "start",
         {"deployment_id": deployment_id, "org_id": "org-1"},
     )
+
+
+def test_name_resolution_ignores_deleted_duplicates() -> None:
+    active_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient(
+        deployments=[
+            {
+                "deployment_id": "8ac7142f-8378-49b8-b555-fa29bd7db92b",
+                "deployment_name": "shared-name",
+                "status": "DELETED",
+            },
+            {
+                "deployment_id": active_id,
+                "deployment_name": "shared-name",
+                "status": "STOPPED",
+            },
+            {
+                "deployment_id": "d5b09822-1750-4673-80bf-7aef6e872191",
+                "deployment_name": "shared-name",
+                "status": "DELETED",
+            },
+        ]
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    assert manager.resolve_id("shared-name") == active_id
 
 
 def test_duplicate_deployment_name_fails_without_action() -> None:

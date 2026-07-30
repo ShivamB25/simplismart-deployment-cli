@@ -64,7 +64,9 @@ class DeploymentManager:
 
         active_matches = {
             deployment_id: row
-            for deployment_id, row in self._deployments_named(manifest.deployment_name).items()
+            for deployment_id, row in self._deployments_named(
+                manifest.deployment_name
+            ).items()
             if self._deployment_status(row) != "DELETED"
         }
         if len(active_matches) > 1:
@@ -75,7 +77,9 @@ class DeploymentManager:
             )
         if not active_matches:
             deployment = self._client.create_deployment(desired_deployment)
-            deployment_id = self._detail_value(deployment, "deployment_id", "uuid", "id")
+            deployment_id = self._detail_value(
+                deployment, "deployment_id", "uuid", "id"
+            )
             if not deployment_id:
                 raise RuntimeError("Simplismart did not return a deployment ID")
             deployment_created = True
@@ -158,7 +162,6 @@ class DeploymentManager:
             )
         return model_repo, False
 
-
     def list(
         self,
         *,
@@ -235,16 +238,24 @@ class DeploymentManager:
                 break
             offset += page_size
 
-        if not matches:
+        active_matches = {
+            deployment_id: row
+            for deployment_id, row in matches.items()
+            if self._deployment_status(row) != "DELETED"
+        }
+        if not active_matches:
+            suffix = " (only deleted deployments matched)" if matches else ""
             raise DeploymentNotFoundError(
-                f"no deployment named {reference!r}; use `list` to see exact names"
+                f"no non-deleted deployment named {reference!r}{suffix}; "
+                "use `list` to see exact names"
             )
-        if len(matches) > 1:
-            ids = ", ".join(sorted(matches))
+        if len(active_matches) > 1:
+            ids = ", ".join(sorted(active_matches))
             raise AmbiguousDeploymentError(
-                f"deployment name {reference!r} is ambiguous; matching IDs: {ids}"
+                f"deployment name {reference!r} is ambiguous; "
+                f"matching non-deleted IDs: {ids}"
             )
-        return next(iter(matches))
+        return next(iter(active_matches))
 
     def get(self, reference: str) -> Any:
         deployment_id = self.resolve_id(reference)
@@ -269,9 +280,7 @@ class DeploymentManager:
         )
         return {
             "deployment": deployment,
-            "health": self._client.fetch_deployment_health(
-                deployment_id=deployment_id
-            ),
+            "health": self._client.fetch_deployment_health(deployment_id=deployment_id),
         }
 
     def start(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
@@ -299,19 +308,21 @@ class DeploymentManager:
             org_id=org_id or self._settings.org_id,
         )
         return self._changed(deployment_id, "stop", result)
+
     def delete(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
         """Delete a deployment through the current organization-scoped SDK API."""
         deployment_id = self.resolve_id(reference)
         resolved_org_id = org_id or self._settings.org_id
         if not resolved_org_id:
-            raise ValueError("delete needs an organization; set ORG_ID or pass --org-id")
+            raise ValueError(
+                "delete needs an organization; set ORG_ID or pass --org-id"
+            )
 
         result = self._client.delete_deployment(
             deployment_id=deployment_id,
             org_id=resolved_org_id,
         )
         return self._changed(deployment_id, "delete", result)
-
 
     def restart(
         self,
@@ -325,9 +336,7 @@ class DeploymentManager:
         resolved_namespace = namespace or self._settings.deployment_namespace
 
         if not resolved_org_id or not resolved_namespace:
-            detail = self._client.get_model_deployment(
-                deployment_id=deployment_id
-            )
+            detail = self._client.get_model_deployment(deployment_id=deployment_id)
             resolved_org_id = resolved_org_id or self._org_id(detail)
             resolved_namespace = resolved_namespace or self._namespace(detail)
 
@@ -372,9 +381,7 @@ class DeploymentManager:
         last_health: str | None = None
 
         while True:
-            detail = self._client.get_model_deployment(
-                deployment_id=deployment_id
-            )
+            detail = self._client.get_model_deployment(deployment_id=deployment_id)
             last_status = self._deployment_status(detail)
             health: Any = None
 

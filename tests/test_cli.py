@@ -27,6 +27,15 @@ class FakeManager:
             "status": "DEPLOYED",
         }
 
+    def status(self, deployment_id: str) -> dict[str, Any]:
+        return {
+            "deployment": {
+                "deployment_id": deployment_id,
+                "status": "DEPLOYED",
+            },
+            "health": {"data": "Healthy"},
+        }
+
     def start(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
         return {
             "deployment_id": deployment_id,
@@ -51,6 +60,13 @@ class FakeManager:
             "result": {"accepted": True, **kwargs},
         }
 
+    def restart(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "deployment_id": deployment_id,
+            "action": "restart",
+            "changed": True,
+            "result": {"accepted": True, **kwargs},
+        }
 
     def deploy_manifest(self, manifest: str) -> dict[str, Any]:
         return {
@@ -59,7 +75,6 @@ class FakeManager:
             "model_repo_created": True,
             "deployment_created": True,
         }
-
 
     def health(self, deployment_id: str) -> dict[str, str]:
         return {"data": "Progressing", "deployment_id": deployment_id}
@@ -92,6 +107,7 @@ def test_list_emits_machine_readable_json(monkeypatch: Any) -> None:
     assert '"deployment_id": "deployment-1"' in result.stdout
     assert '"status": "DEPLOYED"' in result.stdout
 
+
 def test_delete_command_uses_manager_delete(monkeypatch: Any) -> None:
     monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
 
@@ -106,7 +122,66 @@ def test_delete_command_uses_manager_delete(monkeypatch: Any) -> None:
     assert '"org_id": "org-1"' in result.stdout
 
 
+def test_direct_deployment_commands_accept_multiple_targets(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", FakeManager)
 
+    for command in ("get", "status", "start", "stop", "restart", "health", "delete"):
+        result = runner.invoke(
+            cli.app,
+            [command, "deployment-1", "deployment-2"],
+            env={"SIMPLISMART_PG_TOKEN": "test-token"},
+        )
+
+        assert result.exit_code == 0, (command, result.output)
+        payload = json.loads(result.stdout)
+        assert isinstance(payload, list)
+        assert len(payload) == 2
+        assert "deployment-1" in result.stdout
+        assert "deployment-2" in result.stdout
+
+
+def test_manage_infers_actions_from_refreshed_deployment_state(
+    monkeypatch: Any,
+) -> None:
+    class InteractiveManager(FakeManager):
+        status = "DEPLOYED"
+        actions: list[str] = []
+
+        def list(self, **kwargs: Any) -> list[dict[str, str]]:
+            return [
+                {
+                    "deployment_id": "deployment-1",
+                    "deployment_name": "nightly-inference",
+                    "status": self.status,
+                }
+            ]
+
+        def start(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+            self.status = "DEPLOYED"
+            self.actions.append("start")
+            return {"deployment_id": deployment_id, "action": "start"}
+
+        def stop(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+            self.status = "STOPPED"
+            self.actions.append("stop")
+            return {"deployment_id": deployment_id, "action": "stop"}
+
+    monkeypatch.setattr(cli, "DeploymentManager", InteractiveManager)
+
+    result = runner.invoke(
+        cli.app,
+        ["manage"],
+        input="1\ny\n1\ny\nq\n",
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert InteractiveManager.actions == ["stop", "start"]
+    assert "nightly-inference" in result.stdout
+    assert "DEPLOYED" in result.stdout
+    assert "STOPPED" in result.stdout
 
 
 def test_health_gate_has_distinct_unhealthy_exit_code(monkeypatch: Any) -> None:
@@ -234,10 +309,10 @@ def test_daily_schedule_accepts_name_and_human_local_times(monkeypatch: Any) -> 
     )
 
     assert result.exit_code == 0
-    assert '\"deployment_id\": \"nightly-inference\"' in result.stdout
-    assert '\"start\": \"0 10 * * *\"' in result.stdout
-    assert '\"end\": \"0 1 * * *\"' in result.stdout
-    assert '\"crosses_midnight\": true' in result.stdout
+    assert '"deployment_id": "nightly-inference"' in result.stdout
+    assert '"start": "0 10 * * *"' in result.stdout
+    assert '"end": "0 1 * * *"' in result.stdout
+    assert '"crosses_midnight": true' in result.stdout
 
 
 def test_foreground_schedule_retries_transient_failure(monkeypatch: Any) -> None:
