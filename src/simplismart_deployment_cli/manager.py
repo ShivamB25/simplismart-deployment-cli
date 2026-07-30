@@ -165,14 +165,34 @@ class DeploymentManager:
         model_repo_id: str | None = None,
         status: str | None = None,
         offset: int = 0,
-        count: int = 20,
-    ) -> Any:
-        return self._client.list_deployments(
-            model_repo_id=model_repo_id,
-            status=status,
-            offset=offset,
-            count=count,
-        )
+        count: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List the requested deployments across the SDK's 20-row pages."""
+        rows: list[dict[str, Any]] = []
+        next_offset = offset
+        remaining = count
+        sdk_page_size = 20
+
+        while remaining is None or remaining > 0:
+            page_count = (
+                sdk_page_size if remaining is None else min(sdk_page_size, remaining)
+            )
+            page = self._client.list_deployments(
+                model_repo_id=model_repo_id,
+                status=status,
+                offset=next_offset,
+                count=page_count,
+            )
+            page_rows = self._result_rows(page)
+            rows.extend(page_rows)
+            if len(page_rows) < page_count:
+                break
+
+            next_offset += len(page_rows)
+            if remaining is not None:
+                remaining -= len(page_rows)
+
+        return rows
 
     def _deployments_named(self, name: str) -> dict[str, dict[str, Any]]:
         """Return every deployment with an exact name, indexed by deployment ID."""

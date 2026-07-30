@@ -68,7 +68,8 @@ Root files contain only package, contributor, and repository configuration.
 ## Deployment commands
 
 ```bash
-# Interactive terminals get a table; pipes/files get JSON automatically
+# Interactive terminals get a table; pipes/files get JSON automatically.
+# All deployments are listed unless --count sets a maximum.
 uv run simplismart-deploy list
 uv run simplismart-deploy list --status DEPLOYED --count 50
 uv run simplismart-deploy get DEPLOYMENT_NAME_OR_UUID

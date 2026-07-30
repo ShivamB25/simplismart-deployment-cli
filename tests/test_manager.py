@@ -28,7 +28,9 @@ class FakeClient:
 
     def list_deployments(self, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls.append(("list", kwargs))
-        return self.deployments
+        offset = kwargs["offset"]
+        count = min(kwargs["count"], 20)
+        return self.deployments[offset : offset + count]
 
     def start_deployment(self, **kwargs: Any) -> dict[str, str]:
         self.calls.append(("start", kwargs))
@@ -91,6 +93,32 @@ def settings(org_id: str | None = "org-1") -> Settings:
         org_id=org_id,
         deployment_namespace=None,
     )
+
+
+def test_list_returns_every_sdk_page_by_default() -> None:
+    deployments = [
+        {"deployment_id": f"deployment-{index}"} for index in range(42)
+    ]
+    client = FakeClient(deployments=deployments)
+    manager = DeploymentManager(settings(), client=client)
+
+    assert manager.list() == deployments
+    list_calls = [kwargs for action, kwargs in client.calls if action == "list"]
+    assert [call["offset"] for call in list_calls] == [0, 20, 40]
+    assert [call["count"] for call in list_calls] == [20, 20, 20]
+
+
+def test_list_count_spans_the_sdk_page_cap() -> None:
+    deployments = [
+        {"deployment_id": f"deployment-{index}"} for index in range(30)
+    ]
+    client = FakeClient(deployments=deployments)
+    manager = DeploymentManager(settings(), client=client)
+
+    assert manager.list(count=25) == deployments[:25]
+    list_calls = [kwargs for action, kwargs in client.calls if action == "list"]
+    assert [call["offset"] for call in list_calls] == [0, 20]
+    assert [call["count"] for call in list_calls] == [20, 5]
 
 
 def test_start_is_idempotent_when_already_deployed() -> None:

@@ -167,7 +167,10 @@ def list_deployments(
         typer.Option(help="Filter by DEPLOYED, PENDING, FAILED, STOPPED, or DELETED."),
     ] = None,
     offset: Annotated[int, typer.Option(min=0)] = 0,
-    count: Annotated[int, typer.Option(min=1, max=100)] = 20,
+    count: Annotated[
+        int | None,
+        typer.Option(min=1, help="Maximum rows to return; defaults to all rows."),
+    ] = None,
 ) -> None:
     """List deployments with optional filters."""
     normalized_status = status.upper() if status else None
