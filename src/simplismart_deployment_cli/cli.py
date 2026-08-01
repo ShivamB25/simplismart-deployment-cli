@@ -963,7 +963,7 @@ def _manage_deployments(
 
         _render_management_rows(deployments)
         selection = typer.prompt(
-            "Select number(s), comma-separated; use 'all' or 'q' to quit"
+            f"Select deployments [1-{len(deployments)}, all, q]"
         ).strip()
         if selection.lower() in {"q", "quit"}:
             return
@@ -999,29 +999,36 @@ def _manage_deployments(
             continue
 
         operation = manager.start if action == "start" else manager.stop
-        results = [
-            operation(_deployment_row_id(row) or "", org_id=org_id) for row in selected
-        ]
-        _render_rows(results)
-        console.print()
+        for row in selected:
+            operation(_deployment_row_id(row) or "", org_id=org_id)
+
+        verb = "Started" if action == "start" else "Stopped"
+        noun = "deployment" if len(selected) == 1 else "deployments"
+        console.print(f"[bold green]{verb} {len(selected)} {noun}.[/bold green]\n")
 
 
 def _render_management_rows(deployments: list[dict[str, Any]]) -> None:
     table = Table(
         title="Deployments",
+        title_justify="left",
+        title_style="bold cyan",
         show_header=True,
         header_style="bold",
     )
-    table.add_column("#", justify="right")
-    table.add_column("Deployment")
-    table.add_column("Status")
-    table.add_column("ID")
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Deployment", style="bold", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("ID (short)", style="dim", no_wrap=True)
     for index, row in enumerate(deployments, start=1):
+        deployment_id = _deployment_row_id(row) or ""
+        short_id = (
+            f"{deployment_id[:8]}…" if len(deployment_id) > 12 else deployment_id
+        )
         table.add_row(
             str(index),
             _deployment_row_label(row),
             _deployment_row_status(row),
-            _deployment_row_id(row) or "",
+            short_id,
         )
     console.print(table)
 

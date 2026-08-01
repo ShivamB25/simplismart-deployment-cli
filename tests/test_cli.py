@@ -182,6 +182,50 @@ def test_manage_infers_actions_from_refreshed_deployment_state(
     assert "nightly-inference" in result.stdout
     assert "DEPLOYED" in result.stdout
     assert "STOPPED" in result.stdout
+    assert "Select deployments [1-1, all, q]" in result.stdout
+    assert "Stopped 1 deployment." in result.stdout
+    assert "Started 1 deployment." in result.stdout
+
+
+def test_manage_reports_plural_batch_summary(monkeypatch: Any) -> None:
+    deployment_ids = (
+        "9bd51135-f42f-49bd-89c0-974172e7d818",
+        "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+    )
+    actions: list[str] = []
+
+    class BatchManager(FakeManager):
+        def list(self, **kwargs: Any) -> list[dict[str, str]]:
+            return [
+                {
+                    "deployment_id": deployment_id,
+                    "deployment_name": f"inference-{index}",
+                    "status": "STOPPED" if not actions else "DEPLOYED",
+                }
+                for index, deployment_id in enumerate(deployment_ids, start=1)
+            ]
+
+        def start(self, deployment_id: str, **kwargs: Any) -> dict[str, Any]:
+            actions.append(deployment_id)
+            return {"deployment_id": deployment_id}
+
+    monkeypatch.setattr(cli, "DeploymentManager", BatchManager)
+
+    result = runner.invoke(
+        cli.app,
+        ["manage"],
+        input="all\ny\nq\n",
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert actions == list(deployment_ids)
+    assert "Select deployments [1-2, all, q]" in result.stdout
+    assert "Started 2 deployments." in result.stdout
+    assert "ID (short)" in result.stdout
+    assert "9bd51135…" in result.stdout
+    assert deployment_ids[0] not in result.stdout
+    assert "Deployment Id" not in result.stdout
 
 
 def test_health_gate_has_distinct_unhealthy_exit_code(monkeypatch: Any) -> None:
