@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
+import pytest
 from typer.testing import CliRunner
 
 from simplismart_deployment_cli import cli
@@ -147,7 +148,7 @@ def test_manage_infers_actions_from_refreshed_deployment_state(
 ) -> None:
     class InteractiveManager(FakeManager):
         status = "DEPLOYED"
-        actions: list[str] = []
+        actions: ClassVar[list[str]] = []
 
         def list(self, **kwargs: Any) -> list[dict[str, str]]:
             return [
@@ -463,3 +464,403 @@ def test_sensitive_sdk_fields_are_redacted_from_output(monkeypatch: Any) -> None
     assert "super-secret-value" not in result.stdout
     assert "another-secret" not in result.stdout
     assert result.stdout.count("<redacted>") == 2
+
+
+class UpdateEnvManager(FakeManager):
+    last_instance: Any = None
+
+    def __init__(self, settings: Any) -> None:
+        super().__init__(settings)
+        self.update_calls: list[tuple[str, dict[str, str], list[str]]] = []
+        self.wait_calls: list[tuple[str, dict[str, Any]]] = []
+        self.environment = {"OLD_VAR": "old-value"}
+        type(self).last_instance = self
+
+    def update_env(
+        self,
+        reference: str,
+        *,
+        values: dict[str, str],
+        unset: list[str],
+    ) -> dict[str, Any]:
+        self.update_calls.append((reference, values, unset))
+        self.environment.update(values)
+        for name in unset:
+            self.environment.pop(name, None)
+        return {
+            "deployment_id": "9bd51135-f42f-49bd-89c0-974172e7d818",
+            "action": "update-env",
+            "changed": bool(values or unset),
+            "updated_keys": sorted(values),
+            "removed_keys": sorted(unset),
+            "verified": True,
+        }
+
+    def wait_for_status(
+        self,
+        deployment_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        self.wait_calls.append((deployment_id, kwargs))
+        return {
+            "deployment": {
+                "deployment_id": deployment_id,
+                "status": "DEPLOYED",
+                "env_variables": dict(self.environment),
+                "deployment_custom_configuration": {
+                    "command": ["server", "--api-key", "preserved-command-secret"],
+                },
+            },
+            "health": {"data": "Healthy"},
+        }
+
+
+def test_update_env_uses_process_environment_over_dotenv(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    UpdateEnvManager.last_instance = None
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "HF_TOKEN=dotenv-secret\n"
+        "MODEL_NAME=model-from-dotenv\n"
+        "EMPTY_VALUE=dotenv-value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "DeploymentManager", UpdateEnvManager)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "update-env",
+            "nightly-inference",
+            "--from-env",
+            "HF_TOKEN",
+            "--from-env",
+            "MODEL_NAME",
+            "--from-env",
+            "EMPTY_VALUE",
+            "--unset",
+            "OLD_VAR",
+            "--unset",
+            "OTHER_OLD_VAR",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "HF_TOKEN": "process-secret",
+            "EMPTY_VALUE": "",
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    manager = UpdateEnvManager.last_instance
+    assert manager is not None
+    assert manager.update_calls == [
+        (
+            "nightly-inference",
+            {
+                "HF_TOKEN": "process-secret",
+                "MODEL_NAME": "model-from-dotenv",
+                "EMPTY_VALUE": "",
+            },
+            ["OLD_VAR", "OTHER_OLD_VAR"],
+        )
+    ]
+    assert '"action": "update-env"' in result.stdout
+    assert '"updated_keys": [' in result.stdout
+    assert '"removed_keys": [' in result.stdout
+    assert '"verified": true' in result.stdout
+    assert "process-secret" not in result.output
+    assert "dotenv-secret" not in result.output
+    assert "model-from-dotenv" not in result.output
+
+
+def test_update_env_missing_source_fails_before_manager_creation(
+    monkeypatch: Any,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("MISSING_TOKEN\n", encoding="utf-8")
+    monkeypatch.delenv("MISSING_TOKEN", raising=False)
+    constructions: list[Any] = []
+
+    def manager_factory(settings: Any) -> Any:
+        constructions.append(settings)
+        raise AssertionError("manager must not be constructed")
+
+    monkeypatch.setattr(cli, "DeploymentManager", manager_factory)
+    result = runner.invoke(
+        cli.app,
+        ["update-env", "nightly-inference", "--from-env", "MISSING_TOKEN"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == cli.EXIT_CONFIG
+    assert constructions == []
+    assert "MISSING_TOKEN" in result.stderr
+    assert "not defined" in result.stderr
+
+
+def test_update_env_rejects_empty_duplicate_conflicting_and_invalid_inputs(
+    monkeypatch: Any,
+) -> None:
+    constructions: list[Any] = []
+
+    def manager_factory(settings: Any) -> Any:
+        constructions.append(settings)
+        raise AssertionError("invalid updates must fail before manager creation")
+
+    monkeypatch.setattr(cli, "DeploymentManager", manager_factory)
+    invalid_options = (
+        [],
+        ["--from-env", "DUPLICATE", "--from-env", "DUPLICATE"],
+        ["--unset", "DUPLICATE", "--unset", "DUPLICATE"],
+        ["--from-env", "CONFLICT", "--unset", "CONFLICT"],
+        ["--set", "APP_SETTING=non-secret"],
+        ["--from-env", "INVALID-NAME"],
+    )
+    for options in invalid_options:
+        result = runner.invoke(
+            cli.app,
+            ["update-env", "nightly-inference", *options],
+            env={
+                "SIMPLISMART_PG_TOKEN": "test-token",
+                "DUPLICATE": "not-used",
+                "CONFLICT": "not-used",
+            },
+        )
+
+        assert result.exit_code == cli.EXIT_CONFIG, (options, result.output)
+    assert constructions == []
+
+
+def test_update_env_redacts_arbitrary_provider_error_values(
+    monkeypatch: Any,
+) -> None:
+    secret = "non-keyword-provider-echo-value"
+
+    class EchoingManager(UpdateEnvManager):
+        def update_env(
+            self,
+            reference: str,
+            *,
+            values: dict[str, str],
+            unset: list[str],
+        ) -> dict[str, Any]:
+            raise RuntimeError(f"provider rejected value {values['APP_SETTING']}")
+
+    monkeypatch.setattr(cli, "DeploymentManager", EchoingManager)
+    result = runner.invoke(
+        cli.app,
+        [
+            "update-env",
+            "nightly-inference",
+            "--from-env",
+            "APP_SETTING",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "APP_SETTING": secret,
+        },
+    )
+
+    assert result.exit_code == cli.EXIT_SOFTWARE
+    assert secret not in result.output
+    assert "<redacted>" in result.stderr
+
+
+def test_update_env_wait_uses_deployed_healthy_lifecycle_wait(
+    monkeypatch: Any,
+) -> None:
+    UpdateEnvManager.last_instance = None
+    monkeypatch.setattr(cli, "DeploymentManager", UpdateEnvManager)
+    token = "wait-for-this-secret"
+    result = runner.invoke(
+        cli.app,
+        [
+            "update-env",
+            "9bd51135-f42f-49bd-89c0-974172e7d818",
+            "--from-env",
+            "HF_TOKEN",
+            "--unset",
+            "OLD_VAR",
+            "--wait",
+            "--wait-timeout",
+            "30",
+            "--poll-interval",
+            "1",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "HF_TOKEN": token,
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.stdout)
+    assert body["final_state"] == {"status": "DEPLOYED", "health": "HEALTHY"}
+    assert "preserved-command-secret" not in result.output
+    assert token not in result.output
+
+
+def test_update_env_wait_fails_when_healthy_rollout_rolled_back(
+    monkeypatch: Any,
+) -> None:
+    expected_value = "new-secret-requested"
+    actual_value = "old-provider-echo-value"
+
+    class RollbackManager(UpdateEnvManager):
+        def wait_for_status(
+            self,
+            deployment_id: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "deployment": {
+                    "deployment_id": deployment_id,
+                    "status": "DEPLOYED",
+                    "env_variables": {"HF_TOKEN": actual_value},
+                },
+                "health": {"data": "Healthy"},
+            }
+
+    monkeypatch.setattr(cli, "DeploymentManager", RollbackManager)
+    result = runner.invoke(
+        cli.app,
+        [
+            "update-env",
+            "nightly-inference",
+            "--from-env",
+            "HF_TOKEN",
+            "--wait",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "HF_TOKEN": expected_value,
+        },
+    )
+
+    assert result.exit_code == cli.EXIT_WAIT_FAILED
+    assert expected_value not in result.output
+    assert actual_value not in result.output
+
+
+def test_update_env_error_preserves_status_without_provider_payload(
+    monkeypatch: Any,
+) -> None:
+    class UnauthorizedManager(UpdateEnvManager):
+        def update_env(
+            self,
+            reference: str,
+            *,
+            values: dict[str, str],
+            unset: list[str],
+        ) -> dict[str, Any]:
+            raise cli.DeploymentUpdateError(
+                "deployment environment update failed",
+                status_code=401,
+            )
+
+    monkeypatch.setattr(cli, "DeploymentManager", UnauthorizedManager)
+    result = runner.invoke(
+        cli.app,
+        [
+            "update-env",
+            "nightly-inference",
+            "--from-env",
+            "CREDENTIAL",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "CREDENTIAL": "non-keyword-provider-secret",
+        },
+    )
+
+    assert result.exit_code == cli.EXIT_AUTH
+    assert '"status_code": 401' in result.stderr
+    assert "deployment environment update failed" in result.stderr
+    assert "non-keyword-provider-secret" not in result.output
+
+
+def test_update_env_supports_standard_table_output(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(cli, "DeploymentManager", UpdateEnvManager)
+    token = "table-output-secret"
+    result = runner.invoke(
+        cli.app,
+        [
+            "--output",
+            "table",
+            "update-env",
+            "nightly-inference",
+            "--from-env",
+            "HF_TOKEN",
+        ],
+        env={
+            "SIMPLISMART_PG_TOKEN": "test-token",
+            "HF_TOKEN": token,
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "update-env" in result.stdout
+    assert "verified" in result.stdout
+    assert token not in result.output
+
+
+@pytest.mark.parametrize("output", ["json", "table"])
+def test_get_redacts_hf_tokens_in_messages_commands_and_env(
+    monkeypatch: Any, output: str
+) -> None:
+    token = "hf_" + "".join(chr(65 + n % 26) for n in range(34))
+
+    class EchoingManager(FakeManager):
+        def get(self, deployment_id: str) -> dict[str, Any]:
+            return {
+                "deployment_id": deployment_id,
+                "message": f"provider echoed {token}",
+                "deployment_custom_configuration": {
+                    "command": ["serve", "--download-credential", token]
+                },
+                "env": {"CUSTOM_AUTH": "private-model-repo-value"},
+                "environment": {"CUSTOM_AUTH": "private-environment-value"},
+            }
+
+    monkeypatch.setattr(cli, "DeploymentManager", EchoingManager)
+    result = runner.invoke(
+        cli.app,
+        ["--output", output, "get", "deployment-1"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == 0
+    assert token not in result.output
+    assert "private-model-repo-value" not in result.output
+    assert "private-environment-value" not in result.output
+
+
+def test_api_errors_redact_hf_tokens_in_message_and_nested_payload(
+    monkeypatch: Any,
+) -> None:
+    token = "hf_" + "".join(chr(97 + n % 26) for n in range(34))
+
+    class ErrorManager(FakeManager):
+        def get(self, deployment_id: str) -> dict[str, Any]:
+            raise cli.SimplismartError(
+                f"provider rejected {token}",
+                status_code=403,
+                payload={"detail": ["echoed", token]},
+            )
+
+    monkeypatch.setattr(cli, "DeploymentManager", ErrorManager)
+    result = runner.invoke(
+        cli.app,
+        ["get", "deployment-1"],
+        env={"SIMPLISMART_PG_TOKEN": "test-token"},
+    )
+
+    assert result.exit_code == cli.EXIT_AUTH
+    body = json.loads(result.stderr)
+    assert body["status_code"] == 403
+    assert token not in result.output

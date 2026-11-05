@@ -16,6 +16,7 @@ wheels/
 
 # Local agent tooling
 .serena/
+.codegraph/
 results/**
 .DS_Store
 

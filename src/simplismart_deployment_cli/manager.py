@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from time import monotonic, sleep
 from typing import Any
 from uuid import UUID
 
-from simplismart import CronScalingRule, Simplismart
+from simplismart import CronScalingRule, DeploymentUpdate, Simplismart, SimplismartError
 
 from .settings import Settings
+
+_ENVIRONMENT_VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class DeploymentNotFoundError(ValueError):
@@ -24,6 +27,20 @@ class DeploymentWaitError(RuntimeError):
 
 class DeploymentWaitTimeout(DeploymentWaitError):
     """A deployment wait exceeded its deadline."""
+
+
+class DeploymentUpdateError(SimplismartError):
+    """A deployment update failed without exposing environment contents."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message, status_code=status_code)
+
+
+def _deployment_update_error(message: str, error: Exception) -> DeploymentUpdateError:
+    status_code = getattr(error, "status_code", None)
+    if type(status_code) is not int:
+        status_code = None
+    return DeploymentUpdateError(message, status_code=status_code)
 
 
 class DeploymentManager:
@@ -260,6 +277,127 @@ class DeploymentManager:
     def get(self, reference: str) -> Any:
         deployment_id = self.resolve_id(reference)
         return self._client.get_model_deployment(deployment_id=deployment_id)
+
+    def update_env(
+        self,
+        reference: str,
+        *,
+        values: dict[str, str],
+        unset: list[str],
+    ) -> dict[str, Any]:
+        """Update only the requested deployment environment variables."""
+        if not isinstance(reference, str) or not reference:
+            raise ValueError("deployment reference must be a non-empty name or UUID")
+        if not isinstance(values, dict):
+            raise TypeError("environment values must be a dictionary")
+        if not isinstance(unset, list):
+            raise TypeError("environment removals must be a list")
+        if any(
+            not isinstance(name, str)
+            or _ENVIRONMENT_VARIABLE_NAME.fullmatch(name) is None
+            for name in (*values, *unset)
+        ):
+            raise ValueError(
+                "environment variable names must be valid shell identifiers"
+            )
+        if any(not isinstance(value, str) for value in values.values()):
+            raise ValueError("environment variable values must be strings")
+        if len(set(unset)) != len(unset):
+            raise ValueError("environment variable names must not be repeated")
+        if set(values).intersection(unset):
+            raise ValueError("an environment variable cannot be updated and unset")
+        if not values and not unset:
+            raise ValueError("at least one environment update or removal is required")
+
+        try:
+            deployment_id = self.resolve_id(reference)
+        except DeploymentNotFoundError:
+            raise DeploymentNotFoundError(
+                "no deployment was found for the environment update"
+            ) from None
+        except AmbiguousDeploymentError:
+            raise AmbiguousDeploymentError(
+                "deployment name is ambiguous for the environment update"
+            ) from None
+        except Exception as exc:  # noqa: BLE001 - SDK exceptions may echo credentials.
+            raise _deployment_update_error(
+                "could not resolve deployment for the environment update", exc
+            ) from None
+
+        try:
+            detail = self._client.get_model_deployment(deployment_id=deployment_id)
+        except Exception as exc:  # noqa: BLE001 - SDK exceptions may echo credentials.
+            raise _deployment_update_error(
+                "could not read deployment environment variables", exc
+            ) from None
+
+        existing_env = detail.get("env_variables") if isinstance(detail, dict) else None
+        if not isinstance(existing_env, dict):
+            raise DeploymentUpdateError(
+                "deployment environment variables are unavailable; refusing to replace them"
+            )
+
+        status = self._deployment_status(detail)
+        merged_env = existing_env.copy()
+        updated_keys = sorted(
+            key
+            for key, value in values.items()
+            if key not in existing_env or existing_env[key] != value
+        )
+        removed_keys = sorted(key for key in unset if key in existing_env)
+        for key in updated_keys:
+            merged_env[key] = values[key]
+        for key in removed_keys:
+            del merged_env[key]
+
+        summary = {
+            "deployment_id": deployment_id,
+            "action": "update-env",
+            "changed": bool(updated_keys or removed_keys),
+            "updated_keys": updated_keys,
+            "removed_keys": removed_keys,
+            "verified": True,
+        }
+        if not updated_keys and not removed_keys:
+            return summary
+
+        if status != "DEPLOYED":
+            raise ValueError(
+                "environment updates require a DEPLOYED deployment; "
+                "wait for the current rollout to finish"
+            )
+
+        try:
+            payload = DeploymentUpdate(env_variables=merged_env)
+            self._client.update_deployment(
+                deployment_id=deployment_id,
+                payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK exceptions may echo credentials.
+            raise _deployment_update_error(
+                "deployment environment update failed", exc
+            ) from None
+
+        try:
+            verified_detail = self._client.get_model_deployment(
+                deployment_id=deployment_id
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK exceptions may echo credentials.
+            raise _deployment_update_error(
+                "could not verify deployment environment update", exc
+            ) from None
+
+        verified_env = (
+            verified_detail.get("env_variables")
+            if isinstance(verified_detail, dict)
+            else None
+        )
+        if not isinstance(verified_env, dict) or verified_env != merged_env:
+            raise DeploymentUpdateError(
+                "deployment environment update could not be verified"
+            )
+
+        return summary
 
     def status(self, reference: str) -> dict[str, Any]:
         deployment_id = self.resolve_id(reference)

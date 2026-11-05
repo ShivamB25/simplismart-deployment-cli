@@ -2,8 +2,8 @@
 
 A community-built, interactive and automation-safe CLI around the
 [Simplismart Python SDK](https://docs.simplismart.ai/sdk/python/overview).
-It supports one-shot lifecycle commands, a foreground daily start/stop loop,
-and durable native Simplismart cron scaling.
+It supports one-shot lifecycle and environment-update commands, a foreground
+daily start/stop loop, and durable native Simplismart cron scaling.
 
 ## Why this CLI
 
@@ -77,6 +77,7 @@ uv run simplismart-deploy status DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy start DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy stop DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy restart DEPLOYMENT_NAME_OR_UUID
+uv run simplismart-deploy update-env DEPLOYMENT_NAME_OR_UUID --from-env HF_TOKEN
 uv run simplismart-deploy health DEPLOYMENT_NAME_OR_UUID
 uv run simplismart-deploy delete DEPLOYMENT_NAME_OR_UUID --org-id "$ORG_ID"
 
@@ -134,6 +135,67 @@ Names must be unique; ambiguous names fail without changing either deployment.
 namespace, resolved from command options, environment configuration, or
 deployment details. `--wait` polls read-only status endpoints, prints progress
 only on an interactive terminal, and emits one final JSON document.
+
+## Updating deployment environment
+
+Put the desired values in the ignored project `.env` or platform/process
+environment, then pass **names only**:
+
+```bash
+# Rotate the Hugging Face credential without changing other container settings.
+uv run simplismart-deploy update-env zapim-gemma4-31b-it-vllm-qat \
+  --from-env HF_TOKEN --wait --wait-timeout 1800
+
+# Multiple updates and explicit removals can be submitted together.
+# Define LOG_LEVEL locally first; values are never command-line arguments.
+uv run simplismart-deploy update-env DEPLOYMENT_NAME_OR_UUID \
+  --from-env HF_TOKEN --from-env LOG_LEVEL --unset OBSOLETE_SETTING
+```
+
+- Repeat `--from-env NAME` and `--unset NAME` as needed. Names must be shell
+  identifiers. Duplicate/conflicting names and missing source values fail before
+  API calls. Process values override `.env`; an explicitly defined empty string
+  is valid, while a valueless dotenv key is missing.
+- The command resolves one exact name or UUID, reads its current environment,
+  merges the requested changes, and submits the complete dictionary through
+  SDK `DeploymentUpdate` / `update_deployment`. Unrelated variables are retained;
+  unavailable/non-dictionary environments are refused rather than replaced.
+- Identical values and already-absent removals are successful read-only no-ops:
+  no edit request or extra restart. Actual changes require status `DEPLOYED`.
+  Pending/deploying/progressing, stopped, terminal, unknown, and missing statuses
+  are refused, preventing overlap with creation or another rollout.
+- Every edit is read back and compared against the entire desired dictionary.
+  Output contains only the deployment ID, action, changed/verified flags, and
+  changed/removed **key names**, never values or raw provider responses.
+- Without `--wait`, `verified: true` means saved configuration, **not readiness**.
+  `--wait` additionally requires `DEPLOYED` and `HEALTHY`, then checks the requested
+  values/removals again so a healthy rollback cannot be reported as success.
+  Its `final_state` contains only status and health.
+- Env values have no raw CLI option: do not put credentials in argv, shell history,
+  docs, or committed manifests. Keep `HF_TOKEN` as the only Hugging Face variable.
+  The SDK minimum is `0.1.15`; `python-dotenv` is a direct dependency.
+- CLI JSON/table output and error payloads redact environment dictionaries and
+  Hugging Face token-shaped strings even when a provider embeds them in free-form
+  messages or command arrays. This is defense in depth, not permission to publish
+  deployment logs. On a revocation alert, keep the token revoked, scan using
+  redacted output, and identify the exposure source before issuing a replacement.
+
+The read/merge/edit sequence is **not atomic**; avoid concurrent edits to the same
+deployment. If an API/read-back/wait step fails after submission, the edit may
+already have applied: inspect status before retrying. The CLI does not delete,
+recreate, manually restart, or silently roll back deployments.
+
+Live edits do not rewrite manifests. Keep `deployment.envVariables` in the
+checked-in `deployments/<model>/*.yaml` profile consistent with the intended
+configuration, using `${VARIABLE}` references for credentials. An env-only token
+rotation needs no manifest change when `${HF_TOKEN}` is already referenced.
+
+Provider references: [SDK update API](https://docs.simplismart.ai/sdk/python/deployments#update_deployment)
+and [edit rollout behavior](https://docs.simplismart.ai/model-suite/deployments/edit-deployment).
+The SDK 0.1.15 edit model exposes `env_variables`; a live HF_TOKEN edit and exact
+read-back were verified. The provider's public examples do not specify dictionary
+merge semantics, so this CLI sends the full merged environment and checks it.
+Rolling updates can drop requests; schedule changes accordingly.
 
 ## Daily schedules
 
@@ -275,5 +337,6 @@ All dependency operations use uv:
 uv add PACKAGE
 uv add --dev PACKAGE
 uv lock
+uv lock --upgrade && uv sync
 uv run pytest -q
 ```

@@ -34,6 +34,40 @@
   image, model, GPU, and deployment ID.
 - Do not attribute `FetchFailed` to command flags without startup logs.
 
+## Deployment environment updates
+
+- Rotate container credentials with
+  `uv run simplismart-deploy update-env NAME_OR_UUID --from-env HF_TOKEN --wait --wait-timeout 1800`.
+  Repeat `--from-env NAME` or `--unset NAME`; never pass secret values in argv.
+- Route env changes through `DeploymentManager.update_env(...)`: read current
+  env, preserve unrelated variables, edit through SDK `DeploymentUpdate`, and
+  verify exact read-back. Missing/malformed current env must fail closed.
+- Actual environment mutations require status `DEPLOYED`; refuse creation,
+  in-progress, stopped, terminal, unknown, or missing states. Identical values
+  remain read-only no-ops. Never overlap an initial rollout with an env edit.
+- `verified` without `--wait` means saved configuration only. Waiting must check
+  DEPLOYED/HEALTHY and recheck desired keys/removals to detect a healthy rollback.
+- Return key-only change summaries and minimal final status/health; never raw
+  deployment detail, env values, provider mutation responses, or echoed secrets.
+- Updates are not atomic; do not race another edit or delete/recreate for a token
+  change. A failed verification may follow an applied edit: inspect before retry.
+- Keep manifest env references consistent; rotating `.env`'s `HF_TOKEN` needs no
+  YAML edit when `${HF_TOKEN}` is already used. SDK minimum: `0.1.15`.
+- API/input/secret regression coverage and operations: Serena
+  `mem:ops/environment_updates`.
+
+## Local off-only auto-stop
+
+- Native Simplismart schedules always require both `--on-at` and `--off-at`.
+  There is no off-only native window.
+- Nightly stop-only uses `scripts/stop-all-deployments.sh` via LaunchAgent
+  `com.simplismart.stop-all-deployments` at local 23:00.
+- The script must refuse stops outside **23:00–08:00 Asia/Kolkata**. launchd
+  can fire a missed 11pm job on later wake; without this guard, an 11am wake
+  would stop daytime GPUs. Override only with `FORCE_STOP=1`.
+- Keep the LaunchAgent WorkingDirectory on this project root so `.env` and
+  `.venv` resolve. Details/commands: Serena `mem:ops/local_auto_stop`.
+
 ## Verification and secrets
 
 - Health alone is insufficient for parser changes. Send an OpenAI-compatible
@@ -43,3 +77,9 @@
   ignored artifacts. Never include API keys, HF tokens, or control-plane tokens.
 - Load credentials only from ignored `.env` files or platform secrets. Never
   print or commit them.
+- Redact HF token-shaped strings in scalar output/error messages and nested
+  command arrays, not only token-named fields. Treat model repository `env` and
+  `environment` dictionaries as sensitive alongside deployment env variables.
+- Incident audits must not print secret matches, prefixes, hashes, raw histories,
+  or unredacted scanner reports. Revocation is containment, not proof of cause;
+  distinguish public Git refs, local stash/reflog objects, and ignored artifacts.

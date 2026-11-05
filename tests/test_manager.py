@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from simplismart import SimplismartError
 
 from simplismart_deployment_cli.manager import (
     AmbiguousDeploymentError,
     DeploymentManager,
+    DeploymentUpdateError,
     DeploymentWaitTimeout,
 )
 from simplismart_deployment_cli.settings import Settings
@@ -48,9 +50,14 @@ class FakeClient:
         self.calls.append(("delete", kwargs))
         return {"accepted": "delete"}
 
-    def update_deployment_autoscaling(self, **kwargs: Any) -> dict[str, bool]:
-        self.calls.append(("autoscaling", kwargs))
+    def update_deployment(self, **kwargs: Any) -> dict[str, bool]:
+        self.calls.append(("update", kwargs))
+        self.detail["env_variables"] = kwargs["payload"].env_variables
         return {"accepted": True}
+
+    def update_deployment_autoscaling(self, **kwargs: Any) -> dict[str, str]:
+        self.calls.append(("autoscaling", kwargs))
+        return {"accepted": "autoscaling"}
 
 
 class SequenceClient(FakeClient):
@@ -375,3 +382,278 @@ def test_duplicate_deployment_name_fails_without_action() -> None:
         manager.stop("shared-name")
 
     assert all(call[0] == "list" for call in client.calls)
+
+
+def test_update_env_preserves_existing_variables_and_verifies() -> None:
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient(
+        detail={
+            "status": "DEPLOYED",
+            "env_variables": {
+                "HF_TOKEN": "old-token",
+                "KEEP_TOKEN": "other-token",
+                "REPLICA_COUNT": 2,
+            },
+        }
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    result = manager.update_env(
+        deployment_id,
+        values={"HF_TOKEN": "new-token", "NEW_TOKEN": "added-token"},
+        unset=[],
+    )
+
+    assert result == {
+        "deployment_id": deployment_id,
+        "action": "update-env",
+        "changed": True,
+        "updated_keys": ["HF_TOKEN", "NEW_TOKEN"],
+        "removed_keys": [],
+        "verified": True,
+    }
+    update = next(kwargs for action, kwargs in client.calls if action == "update")
+    assert update["deployment_id"] == deployment_id
+    assert update["payload"].env_variables == {
+        "HF_TOKEN": "new-token",
+        "KEEP_TOKEN": "other-token",
+        "REPLICA_COUNT": 2,
+        "NEW_TOKEN": "added-token",
+    }
+    assert [action for action, _ in client.calls] == ["get", "update", "get"]
+    assert "new-token" not in repr(result)
+
+
+def test_update_env_removes_only_requested_existing_variables() -> None:
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient(
+        detail={
+            "status": "DEPLOYED",
+            "env_variables": {"KEEP": "preserved", "REMOVE": "removed"},
+        }
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    result = manager.update_env(
+        deployment_id,
+        values={},
+        unset=["REMOVE", "ABSENT"],
+    )
+
+    assert result == {
+        "deployment_id": deployment_id,
+        "action": "update-env",
+        "changed": True,
+        "updated_keys": [],
+        "removed_keys": ["REMOVE"],
+        "verified": True,
+    }
+    update = next(kwargs for action, kwargs in client.calls if action == "update")
+    assert update["payload"].env_variables == {"KEEP": "preserved"}
+
+
+def test_update_env_noop_skips_mutation_during_an_in_flight_edit() -> None:
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient(
+        detail={
+            "status": "EDIT_IN_PROGRESS",
+            "env_variables": {"HF_TOKEN": "same-token"},
+        }
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    result = manager.update_env(
+        deployment_id,
+        values={"HF_TOKEN": "same-token"},
+        unset=["ABSENT"],
+    )
+
+    assert result == {
+        "deployment_id": deployment_id,
+        "action": "update-env",
+        "changed": False,
+        "updated_keys": [],
+        "removed_keys": [],
+        "verified": True,
+    }
+    assert client.calls == [("get", {"deployment_id": deployment_id})]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"status": "DEPLOYED"},
+        {"status": "DEPLOYED", "env_variables": None},
+        {"status": "DEPLOYED", "env_variables": []},
+    ],
+)
+def test_update_env_refuses_unavailable_or_malformed_environment(
+    detail: dict[str, Any],
+) -> None:
+    client = FakeClient(detail=detail)
+    manager = DeploymentManager(settings(), client=client)
+
+    with pytest.raises(DeploymentUpdateError):
+        manager.update_env(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+            values={"TOKEN": "secret"},
+            unset=[],
+        )
+
+    assert [action for action, _ in client.calls] == ["get"]
+
+
+@pytest.mark.parametrize(
+    ("values", "unset", "error_type"),
+    [
+        ({}, [], ValueError),
+        ({"INVALID-NAME": "secret"}, [], ValueError),
+        ({"TOKEN": 1}, [], ValueError),
+        ({"TOKEN": "secret"}, ["TOKEN"], ValueError),
+        ({}, ["TOKEN", "TOKEN"], ValueError),
+        ([], [], TypeError),
+        ({}, (), TypeError),
+    ],
+)
+def test_update_env_validates_programmatic_operations_before_api_calls(
+    values: Any, unset: Any, error_type: type[Exception]
+) -> None:
+    client = FakeClient()
+    manager = DeploymentManager(settings(), client=client)
+
+    with pytest.raises(error_type):
+        manager.update_env(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+            values=values,
+            unset=unset,
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "DELETED",
+        "DELETING",
+        "DELETE_IN_PROGRESS",
+        "FAILED",
+        "EDIT_IN_PROGRESS",
+        "PENDING",
+        "DEPLOYING",
+        "PROGRESSING",
+        "STOPPED",
+        "UNKNOWN",
+        None,
+    ],
+)
+def test_update_env_rejects_non_deployed_statuses(status: str | None) -> None:
+    client = FakeClient(detail={"status": status, "env_variables": {"TOKEN": "old"}})
+    manager = DeploymentManager(settings(), client=client)
+
+    with pytest.raises(ValueError):
+        manager.update_env(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+            values={"TOKEN": "new"},
+            unset=[],
+        )
+
+    assert [action for action, _ in client.calls] == ["get"]
+
+
+def test_update_env_fails_when_readback_does_not_match() -> None:
+    class StaleReadbackClient(FakeClient):
+        def update_deployment(self, **kwargs: Any) -> dict[str, bool]:
+            self.calls.append(("update", kwargs))
+            return {"accepted": True}
+
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = StaleReadbackClient(
+        detail={"status": "DEPLOYED", "env_variables": {"TOKEN": "old"}}
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    with pytest.raises(DeploymentUpdateError, match="could not be verified"):
+        manager.update_env(
+            deployment_id,
+            values={"TOKEN": "new-secret"},
+            unset=[],
+        )
+
+    assert [action for action, _ in client.calls] == ["get", "update", "get"]
+
+
+def test_update_env_api_error_does_not_echo_environment_values() -> None:
+    secret = "token-that-must-not-leak"
+
+    class EchoingErrorClient(FakeClient):
+        def update_deployment(self, **kwargs: Any) -> dict[str, bool]:
+            self.calls.append(("update", kwargs))
+            raise SimplismartError(
+                f"provider echoed {secret}",
+                status_code=403,
+                payload={"env_variables": {"TOKEN": secret}},
+            )
+
+    client = EchoingErrorClient(
+        detail={"status": "DEPLOYED", "env_variables": {"TOKEN": "old"}}
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    with pytest.raises(DeploymentUpdateError) as caught:
+        manager.update_env(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+            values={"TOKEN": secret},
+            unset=[],
+        )
+
+    assert caught.value.status_code == 403
+    assert caught.value.payload == {}
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)
+
+
+def test_update_env_resolves_exact_deployment_name() -> None:
+    deployment_id = "fc9318f7-1cfb-4e40-b14c-93c09b47205c"
+    client = FakeClient(
+        detail={"status": "DEPLOYED", "env_variables": {}},
+        deployments=[
+            {
+                "deployment_id": deployment_id,
+                "deployment_name": "nightly-inference",
+            }
+        ],
+    )
+    manager = DeploymentManager(settings(), client=client)
+
+    result = manager.update_env(
+        "nightly-inference",
+        values={"TOKEN": "new"},
+        unset=[],
+    )
+
+    assert result["deployment_id"] == deployment_id
+    update = next(kwargs for action, kwargs in client.calls if action == "update")
+    assert update["deployment_id"] == deployment_id
+
+
+def test_update_env_unexpected_sdk_error_cannot_expose_credentials() -> None:
+    secret = "unparsed-provider-credential"
+
+    class InvalidResponseClient(FakeClient):
+        def get_model_deployment(self, **kwargs: Any) -> dict[str, Any]:
+            raise ValueError(f"invalid provider response containing {secret}")
+
+    manager = DeploymentManager(settings(), client=InvalidResponseClient())
+
+    with pytest.raises(DeploymentUpdateError) as caught:
+        manager.update_env(
+            "fc9318f7-1cfb-4e40-b14c-93c09b47205c",
+            values={"HF_TOKEN": "replacement"},
+            unset=[],
+        )
+
+    assert caught.value.status_code is None
+    assert caught.value.payload == {}
+    assert secret not in str(caught.value)
+    assert secret not in repr(caught.value)

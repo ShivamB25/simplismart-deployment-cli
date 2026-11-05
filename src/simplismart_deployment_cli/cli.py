@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +13,7 @@ from time import sleep
 from typing import Annotated, Any
 
 import typer
+from dotenv import dotenv_values
 from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
@@ -20,6 +23,7 @@ from simplismart import SimplismartError
 from .manager import (
     DeploymentManager,
     DeploymentNotFoundError,
+    DeploymentUpdateError,
     DeploymentWaitError,
 )
 from .scheduling import DailyWindow, local_timezone_name
@@ -42,6 +46,8 @@ RETRYABLE_SCHEDULE_EXIT_CODES = {EXIT_API, EXIT_WAIT_FAILED}
 REDACTED = "<redacted>"
 SENSITIVE_OUTPUT_KEYS = {
     "api_details",
+    "env",
+    "environment",
     "env_variables",
     "environment_variables",
 }
@@ -53,6 +59,9 @@ SENSITIVE_OUTPUT_FRAGMENTS = (
     "secret",
     "token",
 )
+
+_ENVIRONMENT_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_HF_TOKEN_VALUE = re.compile(r"hf_[A-Za-z0-9]{20,}")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -381,6 +390,94 @@ def delete(
     )
 
 
+@app.command("update-env")
+def update_environment(
+    ctx: typer.Context,
+    deployment_id: DeploymentReference,
+    from_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--from-env",
+            help="Copy a variable from process environment or .env (repeatable).",
+        ),
+    ] = None,
+    unset: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--unset",
+            help="Remove a variable from the deployment (repeatable).",
+        ),
+    ] = None,
+    wait: Annotated[
+        bool,
+        typer.Option(
+            "--wait",
+            help="Wait until the deployment is DEPLOYED and Healthy.",
+        ),
+    ] = False,
+    wait_timeout: Annotated[
+        float,
+        typer.Option(
+            "--wait-timeout",
+            min=1,
+            help="Maximum wait in seconds.",
+        ),
+    ] = DEFAULT_WAIT_TIMEOUT,
+    poll_interval: Annotated[
+        float,
+        typer.Option(
+            "--poll-interval", min=0.1, help="Status polling interval in seconds."
+        ),
+    ] = DEFAULT_POLL_INTERVAL,
+) -> None:
+    """Update deployment environment from dotenv/process variables.
+
+    For secrets, keep values out of command arguments:
+    ``uv run simplismart-deploy update-env DEPLOYMENT --from-env HF_TOKEN``.
+    Place HF_TOKEN in .env or the process environment first.
+    """
+    values, unset_names = _resolve_update_env_inputs(from_env, unset)
+
+    def apply_update(manager: DeploymentManager) -> dict[str, Any]:
+        try:
+            result = _lifecycle_result(
+                ctx,
+                manager,
+                action=lambda: manager.update_env(
+                    deployment_id,
+                    values=values,
+                    unset=unset_names,
+                ),
+                deployment_id=None,
+                target_status="DEPLOYED",
+                require_healthy=True,
+                wait=wait,
+                wait_timeout=wait_timeout,
+                poll_interval=poll_interval,
+            )
+        except DeploymentUpdateError:
+            raise
+        except SimplismartError as exc:
+            raise DeploymentUpdateError(
+                "could not verify deployment environment rollout",
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+        if wait and not _update_env_wait_succeeded(
+            result,
+            values=values,
+            unset=unset_names,
+        ):
+            raise DeploymentWaitError(
+                "deployment reached DEPLOYED and Healthy without retaining "
+                "the requested environment update"
+            )
+        if wait:
+            result["final_state"] = {"status": "DEPLOYED", "health": "HEALTHY"}
+        return result
+
+    _execute(ctx, apply_update, sensitive_values=tuple(values.values()))
+
+
 @app.command()
 def restart(
     ctx: typer.Context,
@@ -681,7 +778,7 @@ def run_schedule(
             try:
                 _execute(
                     ctx,
-                    lambda manager: _reconcile_window(
+                    lambda manager, now=now: _reconcile_window(
                         ctx,
                         manager,
                         deployment_id=deployment_id,
@@ -880,6 +977,72 @@ def _execute_for_deployments(
     return _execute(ctx, execute)
 
 
+def _resolve_update_env_inputs(
+    from_env: list[str] | None,
+    unset: list[str] | None,
+) -> tuple[dict[str, str], list[str]]:
+    names = from_env or []
+    unset_names = unset or []
+    if not names and not unset_names:
+        _fail("provide at least one --from-env or --unset option", EXIT_CONFIG)
+
+    seen: set[str] = set()
+    for name in (*names, *unset_names):
+        if not _ENVIRONMENT_VARIABLE_NAME.fullmatch(name):
+            _fail(
+                "environment variable names must be valid shell identifiers",
+                EXIT_CONFIG,
+            )
+        if name in seen:
+            _fail(
+                "each environment variable may be updated or removed only once",
+                EXIT_CONFIG,
+            )
+        seen.add(name)
+
+    environment: dict[str, str | None] = {}
+    if names:
+        try:
+            environment = {**dotenv_values(".env"), **os.environ}
+        except (OSError, UnicodeError):
+            _fail(
+                "could not read .env while resolving environment updates",
+                EXIT_CONFIG,
+            )
+
+    values: dict[str, str] = {}
+    for name in names:
+        value = environment.get(name)
+        if value is None:
+            _fail(
+                f"environment variable {name!r} requested by --from-env is not "
+                "defined in .env or process environment",
+                EXIT_CONFIG,
+            )
+        values[name] = value
+    return values, unset_names
+
+
+def _update_env_wait_succeeded(
+    result: dict[str, Any],
+    *,
+    values: dict[str, str],
+    unset: list[str],
+) -> bool:
+    final_state = result.get("final_state")
+    deployment = (
+        final_state.get("deployment") if isinstance(final_state, dict) else None
+    )
+    environment = (
+        deployment.get("env_variables") if isinstance(deployment, dict) else None
+    )
+    if not isinstance(environment, dict):
+        return False
+    return all(
+        environment.get(name) == value for name, value in values.items()
+    ) and all(name not in environment for name in unset)
+
+
 def _lifecycle_result(
     ctx: typer.Context,
     manager: DeploymentManager,
@@ -1021,9 +1184,7 @@ def _render_management_rows(deployments: list[dict[str, Any]]) -> None:
     table.add_column("ID (short)", style="dim", no_wrap=True)
     for index, row in enumerate(deployments, start=1):
         deployment_id = _deployment_row_id(row) or ""
-        short_id = (
-            f"{deployment_id[:8]}…" if len(deployment_id) > 12 else deployment_id
-        )
+        short_id = f"{deployment_id[:8]}…" if len(deployment_id) > 12 else deployment_id
         table.add_row(
             str(index),
             _deployment_row_label(row),
@@ -1074,13 +1235,30 @@ def _execute(
     *,
     stream: bool = False,
     render: bool = True,
+    sensitive_values: tuple[str, ...] = (),
 ) -> Any:
     runtime = _runtime(ctx)
     try:
         settings = Settings(**runtime.settings_overrides)
         result = operation(DeploymentManager(settings))
     except ValidationError as exc:
-        _fail(_validation_message(exc), EXIT_CONFIG)
+        _fail(
+            _redact_requested_values(_validation_message(exc), sensitive_values),
+            EXIT_CONFIG,
+        )
+    except DeploymentUpdateError as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code in {401, 403}:
+            exit_code = EXIT_AUTH
+        elif status_code == 404:
+            exit_code = EXIT_NOT_FOUND
+        else:
+            exit_code = EXIT_API
+        _fail(
+            _redact_requested_values(str(exc), sensitive_values),
+            exit_code,
+            status_code=status_code,
+        )
     except SimplismartError as exc:
         status_code = getattr(exc, "status_code", None)
         if status_code in {401, 403}:
@@ -1090,19 +1268,31 @@ def _execute(
         else:
             exit_code = EXIT_API
         _fail(
-            str(exc),
+            _redact_requested_values(str(exc), sensitive_values),
             exit_code,
             status_code=status_code,
-            payload=getattr(exc, "payload", None),
+            payload=(None if sensitive_values else getattr(exc, "payload", None)),
         )
     except DeploymentNotFoundError as exc:
-        _fail(str(exc), EXIT_NOT_FOUND)
+        _fail(
+            _redact_requested_values(str(exc), sensitive_values),
+            EXIT_NOT_FOUND,
+        )
     except DeploymentWaitError as exc:
-        _fail(str(exc), EXIT_WAIT_FAILED)
+        _fail(
+            _redact_requested_values(str(exc), sensitive_values),
+            EXIT_WAIT_FAILED,
+        )
     except ValueError as exc:
-        _fail(str(exc), EXIT_CONFIG)
-    except Exception as exc:  # Last-resort stable failure contract for unattended jobs.
-        _fail(str(exc), EXIT_SOFTWARE)
+        _fail(
+            _redact_requested_values(str(exc), sensitive_values),
+            EXIT_CONFIG,
+        )
+    except Exception as exc:  # noqa: BLE001 - Stable exit contract for unattended jobs.
+        _fail(
+            _redact_requested_values(str(exc), sensitive_values),
+            EXIT_SOFTWARE,
+        )
 
     if stream and runtime.output is OutputFormat.json:
         print(
@@ -1117,7 +1307,7 @@ def _execute(
 def _runtime(ctx: typer.Context) -> RuntimeOptions:
     runtime = ctx.find_root().obj
     if not isinstance(runtime, RuntimeOptions):
-        raise RuntimeError("CLI runtime was not configured")
+        raise RuntimeError("CLI runtime was not configured")  # noqa: TRY004 - Initialization invariant, not user input.
     return runtime
 
 
@@ -1138,6 +1328,8 @@ def _validation_message(exc: ValidationError) -> str:
 
 
 def _redact(value: Any) -> Any:
+    if isinstance(value, str):
+        return _HF_TOKEN_VALUE.sub(REDACTED, value)
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if not isinstance(value, dict):
@@ -1156,6 +1348,19 @@ def _redact(value: Any) -> Any:
         else:
             redacted[key] = _redact(item)
     return redacted
+
+
+def _redact_requested_values(
+    text: str,
+    sensitive_values: tuple[str, ...],
+) -> str:
+    for value in sorted(
+        {value for value in sensitive_values if value},
+        key=len,
+        reverse=True,
+    ):
+        text = text.replace(value, REDACTED)
+    return text
 
 
 def _render(data: Any, output: OutputFormat) -> None:
