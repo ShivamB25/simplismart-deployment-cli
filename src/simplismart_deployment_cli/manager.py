@@ -71,14 +71,6 @@ class DeploymentManager:
         if not org_id:
             raise ValueError("ORG_ID is required to deploy a manifest")
         manifest = load_byoc_manifest(path, org_id=org_id)
-        model_repo, model_repo_created = self._manifest_model_repo(manifest.model_repo)
-        model_repo_id = self._detail_value(model_repo, "uuid", "id")
-        if not model_repo_id:
-            raise RuntimeError("Simplismart did not return a model repository ID")
-        desired_deployment = manifest.deployment_payload(
-            org_id=org_id, model_repo_id=model_repo_id
-        )
-
         active_matches = {
             deployment_id: row
             for deployment_id, row in self._deployments_named(
@@ -92,45 +84,67 @@ class DeploymentManager:
                 "more than one non-deleted deployment is named "
                 f"{manifest.deployment_name!r}: {ids}"
             )
-        if not active_matches:
+
+        deployment_id = next(iter(active_matches), None)
+        deployment = (
+            self._client.get_model_deployment(deployment_id=deployment_id)
+            if deployment_id
+            else None
+        )
+        if deployment_id and deployment is None:
+            raise ValueError(
+                "existing deployment details are unavailable; refusing to create a replacement"
+            )
+        if deployment is not None and self._deployment_status(deployment) == "DELETED":
+            deployment = None
+        existing_model_repo_id = None
+        if deployment is not None:
+            self._lifecycle_status(deployment, action="resume")
+            existing_model_repo_id = self._detail_value(
+                deployment, "model_repo", "model_repo_id"
+            )
+            if not existing_model_repo_id:
+                raise ValueError(
+                    "existing deployment does not report its model repository; "
+                    "refusing to resume an unverified configuration"
+                )
+            desired_fields = manifest.deployment.model_dump(
+                exclude_unset=True, exclude={"model_repo_name", "name"}
+            )
+            drift = [
+                key
+                for key, value in desired_fields.items()
+                if (key in deployment or key == "deployment_custom_configuration")
+                and deployment.get(key) != value
+            ]
+            if drift:
+                raise ValueError(
+                    "existing deployment differs from the manifest in: "
+                    f"{', '.join(sorted(drift))}; inspect it before updating or replacing it"
+                )
+
+        model_repo, model_repo_created = self._manifest_model_repo(
+            manifest.model_repo, create=deployment is None
+        )
+        model_repo_id = self._detail_value(model_repo, "uuid", "id")
+        if not model_repo_id:
+            raise RuntimeError("Simplismart did not return a model repository ID")
+        if existing_model_repo_id and existing_model_repo_id != model_repo_id:
+            raise ValueError("existing deployment uses a different model repository")
+
+        deployment_created = deployment is None
+        if deployment_created:
+            desired_deployment = manifest.deployment_payload(
+                org_id=org_id, model_repo_id=model_repo_id
+            )
             deployment = self._client.create_deployment(desired_deployment)
             deployment_id = self._detail_value(
                 deployment, "deployment_id", "uuid", "id"
             )
             if not deployment_id:
                 raise RuntimeError("Simplismart did not return a deployment ID")
-            deployment_created = True
         else:
-            deployment_id = next(iter(active_matches))
-            deployment = self._client.get_model_deployment(deployment_id=deployment_id)
-            if self._deployment_status(deployment) == "DELETED":
-                deployment = self._client.create_deployment(desired_deployment)
-                deployment_id = self._detail_value(
-                    deployment, "deployment_id", "uuid", "id"
-                )
-                if not deployment_id:
-                    raise RuntimeError("Simplismart did not return a deployment ID")
-                deployment_created = True
-            else:
-                existing_model_repo_id = self._detail_value(
-                    deployment, "model_repo", "model_repo_id"
-                )
-                if existing_model_repo_id and existing_model_repo_id != model_repo_id:
-                    raise ValueError(
-                        f"existing deployment {manifest.deployment_name!r} uses a different model repository"
-                    )
-                existing_command = deployment.get("deployment_custom_configuration")
-                if (
-                    existing_command is not None
-                    and existing_command
-                    != desired_deployment.deployment_custom_configuration
-                ):
-                    raise ValueError(
-                        f"existing deployment {manifest.deployment_name!r} has a different command; "
-                        "inspect its logs, then delete and recreate it explicitly"
-                    )
-                deployment = self.start(deployment_id, org_id=org_id)
-                deployment_created = False
+            deployment = self.start(deployment_id, org_id=org_id)
 
         return {
             "manifest": str(manifest.path),
@@ -141,7 +155,9 @@ class DeploymentManager:
             "deployment_created": deployment_created,
         }
 
-    def _manifest_model_repo(self, desired_model_repo: Any) -> tuple[Any, bool]:
+    def _manifest_model_repo(
+        self, desired_model_repo: Any, *, create: bool = True
+    ) -> tuple[Any, bool]:
         from simplismart import ModelRepoListParams
 
         response = self._client.list_model_repos(
@@ -162,6 +178,11 @@ class DeploymentManager:
                 f"multiple model repositories are named {desired_model_repo.name!r}"
             )
         if not matches:
+            if not create:
+                raise ValueError(
+                    "the manifest model repository was not found; "
+                    "refusing to create one for an existing deployment"
+                )
             return self._client.create_model_repo(desired_model_repo), True
 
         model_repo = matches[0]
@@ -424,7 +445,7 @@ class DeploymentManager:
     def start(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
         deployment_id = self.resolve_id(reference)
         detail = self._client.get_model_deployment(deployment_id=deployment_id)
-        status = self._deployment_status(detail)
+        status = self._lifecycle_status(detail, action="start")
         if status in {"DEPLOYED", "PENDING"}:
             return self._unchanged(deployment_id, status)
 
@@ -437,7 +458,7 @@ class DeploymentManager:
     def stop(self, reference: str, *, org_id: str | None = None) -> dict[str, Any]:
         deployment_id = self.resolve_id(reference)
         detail = self._client.get_model_deployment(deployment_id=deployment_id)
-        status = self._deployment_status(detail)
+        status = self._lifecycle_status(detail, action="stop")
         if status == "STOPPED":
             return self._unchanged(deployment_id, status)
 
@@ -455,12 +476,33 @@ class DeploymentManager:
             raise ValueError(
                 "delete needs an organization; set ORG_ID or pass --org-id"
             )
+        detail = self._client.get_model_deployment(deployment_id=deployment_id)
+        status = self._lifecycle_status(detail, action="delete", allow_deleted=True)
+        if status == "DELETED":
+            return self._unchanged(deployment_id, status)
+        deployment_name = self._detail_value(detail, "deployment_name", "name")
+        reported_id = self._detail_value(detail, "deployment_id", "uuid", "id")
+        if not deployment_name or (reported_id and reported_id != deployment_id):
+            raise ValueError("could not verify deployment identity before deletion")
+        health = self._client.fetch_deployment_health(deployment_id=deployment_id)
+        health_status = self._health_status(health)
+        if not health_status:
+            raise ValueError("deployment health is unavailable; refusing deletion")
+        inspected_state = {
+            "deployment_id": deployment_id,
+            "deployment_name": deployment_name,
+            "status": status,
+            "health": health_status,
+        }
 
         result = self._client.delete_deployment(
             deployment_id=deployment_id,
             org_id=resolved_org_id,
         )
-        return self._changed(deployment_id, "delete", result)
+        return {
+            **self._changed(deployment_id, "delete", result),
+            "before_delete": inspected_state,
+        }
 
     def restart(
         self,
@@ -472,9 +514,10 @@ class DeploymentManager:
         deployment_id = self.resolve_id(reference)
         resolved_org_id = org_id or self._settings.org_id
         resolved_namespace = namespace or self._settings.deployment_namespace
+        detail = self._client.get_model_deployment(deployment_id=deployment_id)
+        self._lifecycle_status(detail, action="restart")
 
         if not resolved_org_id or not resolved_namespace:
-            detail = self._client.get_model_deployment(deployment_id=deployment_id)
             resolved_org_id = resolved_org_id or self._org_id(detail)
             resolved_namespace = resolved_namespace or self._namespace(detail)
 
@@ -597,6 +640,39 @@ class DeploymentManager:
         )
         return self._changed(deployment_id, "schedule_cleared", result)
 
+    @classmethod
+    def _lifecycle_status(
+        cls, detail: Any, *, action: str, allow_deleted: bool = False
+    ) -> str:
+        status = cls._deployment_status(detail)
+        # SDK 0.1.15 documents these statuses, not per-action permissions.
+        if status not in {
+            "PROGRESSING",
+            "PENDING",
+            "DEPLOYING",
+            "DEPLOYED",
+            "DEPLOYED_WARMPOOL",
+            "FAILED_DELETING",
+            "FAILED_WARMPOOL",
+            "FAILED_DELETING_WARMPOOL",
+            "FAILED",
+            "DELETING",
+            "DELETED",
+            "STOPPED",
+            "EDIT_IN_PROGRESS",
+            "EDIT_WARMPOOL_IN_PROGRESS",
+            "EDIT_ROLLBACK_IN_PROGRESS",
+            "EDIT_ROLLBACK_FAILED",
+            "EDIT_SUCCESS",
+        }:
+            raise ValueError(
+                f"cannot {action} deployment with missing or unrecognized status; "
+                "inspect its state before retrying"
+            )
+        if status == "DELETED" and not allow_deleted:
+            raise ValueError(f"cannot {action} a DELETED deployment")
+        return status
+
     @staticmethod
     def _deployment_status(detail: Any) -> str | None:
         if not isinstance(detail, dict):
@@ -613,11 +689,12 @@ class DeploymentManager:
 
     @staticmethod
     def _result_rows(data: Any) -> list[dict[str, Any]]:
-        if isinstance(data, list):
-            return [row for row in data if isinstance(row, dict)]
-        if isinstance(data, dict) and isinstance(data.get("results"), list):
-            return [row for row in data["results"] if isinstance(row, dict)]
-        return []
+        rows = data.get("results") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) for row in rows
+        ):
+            raise ValueError("resource listing is unavailable or malformed")
+        return rows
 
     @classmethod
     def _org_id(cls, detail: Any) -> str | None:

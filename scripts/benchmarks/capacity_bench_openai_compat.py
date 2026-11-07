@@ -176,6 +176,27 @@ def _first_token_text(delta: dict[str, Any]) -> str:
     return "".join(pieces)
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _validate_positive_counts(args: argparse.Namespace) -> None:
+    for option, value in (
+        ("--requests", args.requests),
+        ("--concurrency", args.concurrency),
+        ("--prompt-tokens", args.prompt_tokens),
+        ("--max-tokens", args.max_tokens),
+    ):
+        if value < 1:
+            raise ValueError(f"{option} must be a positive integer")
+
+
 async def one_request(
     client: httpx.AsyncClient,
     *,
@@ -214,6 +235,7 @@ async def one_request(
             total_tokens = 0
             finish_reason: str | None = None
             status = 0
+            stream_done = False
             async with client.stream(
                 "POST",
                 url,
@@ -244,11 +266,15 @@ async def one_request(
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        stream_done = True
                         break
                     try:
                         chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("malformed SSE data: expected JSON") from exc
+
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        raise RuntimeError("stream returned an error payload")
 
                     usage = chunk.get("usage") or {}
                     if usage:
@@ -268,6 +294,8 @@ async def one_request(
                             # TTFT = first non-empty content/reasoning token, not role/metadata.
                             ttft_s = time.perf_counter() - t0
                         output_chunks.append(token_text)
+                if not stream_done:
+                    raise RuntimeError("stream ended before [DONE]")
 
             latency_s = time.perf_counter() - t0
             accepted = completion_tokens == max_tokens
@@ -353,6 +381,7 @@ async def one_request(
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
+    _validate_positive_counts(args)
     base = args.base_url.rstrip("/")
     url = f"{base}/v1/chat/completions"
     health_url = f"{base}/health"
@@ -374,17 +403,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if bad:
         raise RuntimeError(f"non-exact constructed prompts present: {bad[:5]}")
 
-    results: list[RequestResult] = []
-    sem = asyncio.Semaphore(args.concurrency)
 
     async with httpx.AsyncClient(http2=True, verify=not args.insecure, timeout=None) as client:
         health = await client.get(health_url)
         if health.status_code >= 400:
             raise RuntimeError(f"health check failed: HTTP {health.status_code}")
 
-        async def worker(idx: int) -> None:
-            prompt, constructed = prompts[idx]
-            async with sem:
+        results_by_index: list[RequestResult | None] = [None] * args.requests
+        next_index = 0
+
+        async def worker() -> None:
+            nonlocal next_index
+            while next_index < args.requests:
+                idx = next_index
+                next_index += 1
+                prompt, constructed = prompts[idx]
                 result = await one_request(
                     client,
                     url=url,
@@ -398,15 +431,25 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     disable_thinking=args.disable_thinking,
                     stream=args.stream,
                 )
-                results.append(result)
+                results_by_index[idx] = result
+                if progress is not None:
+                    progress.update(1)
 
+        progress = (
+            tqdm_asyncio(total=args.requests, desc="Requests")
+            if tqdm_asyncio and not args.quiet
+            else None
+        )
         wall_t0 = time.perf_counter()
-        tasks = [asyncio.create_task(worker(i)) for i in range(args.requests)]
-        if tqdm_asyncio and not args.quiet:
-            await tqdm_asyncio.gather(*tasks)
-        else:
-            await asyncio.gather(*tasks)
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                for _ in range(min(args.concurrency, args.requests)):
+                    task_group.create_task(worker())
+        finally:
+            if progress is not None:
+                progress.close()
         wall_s = time.perf_counter() - wall_t0
+        results = [result for result in results_by_index if result is not None]
 
     accepted = [r for r in results if r.accepted]
     transport_ok = [r for r in results if r.ok]
@@ -506,15 +549,15 @@ def parse_args() -> argparse.Namespace:
         default="Qwen/Qwen3.6-35B-A3B-FP8",
         help="HF tokenizer id used to construct/verify exact prompt token counts",
     )
-    p.add_argument("--requests", type=int, default=16)
-    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--requests", type=_positive_int, default=16)
+    p.add_argument("--concurrency", type=_positive_int, default=1)
     p.add_argument(
         "--prompt-tokens",
-        type=int,
+        type=_positive_int,
         default=128,
         help="Exact rendered chat-template prompt token count",
     )
-    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--max-tokens", type=_positive_int, default=128)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--insecure", action="store_true")

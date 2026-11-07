@@ -18,6 +18,12 @@ daily start/stop loop, and durable native Simplismart cron scaling.
 
 `restart` intentionally always requests a restart and is not idempotent.
 
+Lifecycle mutations refuse missing or unrecognized statuses. Known states from
+the SDK's documented status catalogue are left to the provider's existing
+per-action rules; the CLI does not infer permissions from their names. Start,
+stop, and restart refuse `DELETED`; deleting an already-deleted UUID is a
+read-only no-op. The existing start/stop no-op rules above remain unchanged.
+
 ## Setup
 
 Requirements: [uv](https://docs.astral.sh/uv/) and Python 3.11 or newer.
@@ -104,6 +110,19 @@ uv run simplismart-deploy deploy \
 uv run simplismart-deploy deploy deployments/qwen3.6-35b-a3b-fp8/sglang-simple.yaml --no-wait
 ```
 
+Manifest loading validates deployment fields before any API call, including
+names, replica configuration, and container configuration types. The current
+manifest schema requires `minPodReplicas=maxPodReplicas=1`; configure replica
+schedules after deployment. Name ambiguity and existing-deployment compatibility
+are checked before creating a repository. Resume requires a reported repository
+ID and matching command; other explicitly requested fields are compared when
+reported by the provider. A missing desired repository is not created for an
+existing deployment.
+
+Creation is still not transactional: if repository creation succeeds and the
+deployment request fails, the repository remains. Inspect it before retrying;
+the CLI does not automatically roll back or delete resources.
+
 ### Deployment profiles
 
 Every vLLM profile pins `vllm/vllm-openai:v0.26.0-cu129`. Changing a vLLM
@@ -127,14 +146,21 @@ Every deployment argument accepts either a UUID or an exact deployment name.
 
 `delete` uses the current organization-scoped Simplismart API endpoint and
 requires `ORG_ID` (from the environment or `--org-id`). Do not use the legacy
-`delete_model_deployment` SDK method. Before deleting a deployment, inspect its
-exact ID and status; after deletion, verify the terminal state and resource
-allocation before creating a replacement.
+`delete_model_deployment` SDK method. Before submitting deletion, the manager
+reads deployment identity, status, and health; unavailable identity/health or a
+conflicting reported ID prevents the request. Successful output includes a
+minimal `before_delete` record. An accepted delete is not proof of terminal
+state or GPU release: verify both before creating a replacement.
 Names must be unique; ambiguous names fail without changing either deployment.
 `ORG_ID` is used when the API requires it. `restart` also needs the Kubernetes
 namespace, resolved from command options, environment configuration, or
 deployment details. `--wait` polls read-only status endpoints, prints progress
 only on an interactive terminal, and emits one final JSON document.
+
+Multi-target commands run sequentially and stop at the first failure. Earlier
+targets may already have changed, later targets are not attempted, and no
+partial success list is emitted on failure. Inspect earlier targets before
+retrying; the batch is not a transaction.
 
 ## Updating deployment environment
 
@@ -316,6 +342,33 @@ without a foreground process. `flock` prevents overlapping invocations:
 
 For a Kubernetes CronJob, set `concurrencyPolicy: Forbid` for the same reason.
 
+### Local stop-only automation
+
+`scripts/stop-all-deployments.sh` is separate from native replica windows and the
+foreground lifecycle scheduler. It stops non-deleted deployments only during
+**23:00–08:00 Asia/Kolkata**; a daytime wake skips the job successfully. Set
+`FORCE_STOP=1` only to intentionally bypass that time guard.
+
+A host-local, per-user lock covers listing through completion of the stop
+command. Overlapping runs fail without submitting stops; the operating system
+releases the lock on process exit. Failed listing, invalid JSON, or malformed
+rows fail before any stop is submitted. An empty valid listing succeeds, and
+the stop command's exit status is preserved. Keep a LaunchAgent's
+WorkingDirectory on this project root so its environment and `.venv` resolve.
+
+## Endpoint benchmarks
+
+The two clients in `scripts/benchmarks/` require positive concurrency, request
+counts, and token budgets; invalid values fail before endpoint traffic. Each run
+uses a fixed-size worker pool bounded by the requested concurrency rather than
+creating a waiting task for every request. Concurrency remains fixed throughout
+the run: neither client automatically searches for a capacity threshold.
+
+Streaming success requires the OpenAI-compatible `[DONE]` marker. EOF without
+it, malformed JSON data, or an in-band error fails the request, even if reported
+usage reaches the requested token budget. In-band error payloads are not echoed.
+Non-stream responses retain their existing acceptance and latency rules.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -341,7 +394,7 @@ uv lock --upgrade && uv sync
 uv run pytest -q
 ```
 
-The permanent suite runs real CLI input validation, manifest environment
-validation, and scheduling/time-zone logic. It does not simulate the SDK or a
-deployment manager. Do not count offline checks as live provider verification;
-report actual CLI smoke checks separately.
+The permanent suite runs real CLI input validation, manifest environment and
+deployment-field validation, and scheduling/time-zone logic. It does not
+simulate the SDK or a deployment manager. Do not count offline checks as live
+provider verification; report actual CLI smoke checks separately.

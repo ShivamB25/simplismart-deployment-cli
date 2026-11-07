@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from simplismart import DeploymentCreate, ModelRepoCreate
 
 _API_VERSION = "simplismart.ai/byoc/v1alpha1"
@@ -24,24 +25,40 @@ _MODEL_REPOSITORY_KEYS = {
     "metricsPath",
     "deploymentCustomConfiguration",
 }
-_DEPLOYMENT_KEYS = {
-    "name",
-    "modelRepoName",
-    "gpuId",
-    "minPodReplicas",
-    "maxPodReplicas",
-    "authEnabled",
-    "envVariables",
-    "healthcheck",
-    "ports",
-    "metricsPath",
-    "deploymentCustomConfiguration",
-    "deploymentTag",
-}
 
 
 class ManifestError(ValueError):
     """Raised when a BYOC manifest cannot be safely applied."""
+
+
+class _DeploymentSpec(BaseModel):
+    """Validate manifest fields before a repository UUID is available."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=3, max_length=255)
+    model_repo_name: str = Field(alias="modelRepoName", min_length=1)
+    gpu_id: str = Field(alias="gpuId", min_length=1)
+    min_pod_replicas: int = Field(alias="minPodReplicas", ge=0)
+    max_pod_replicas: int = Field(alias="maxPodReplicas", ge=1)
+    auth_enabled: bool | None = Field(default=False, alias="authEnabled")
+    env_variables: dict[str, Any] | None = Field(default=None, alias="envVariables")
+    healthcheck: dict[str, Any] | None
+    ports: dict[str, Any] | None
+    metrics_path: list[str] | None = Field(alias="metricsPath")
+    deployment_custom_configuration: dict[str, Any] | None = Field(
+        alias="deploymentCustomConfiguration"
+    )
+    deployment_tag: str | None = Field(default=None, alias="deploymentTag", min_length=1)
+
+    @model_validator(mode="after")
+    def _replica_configuration(self) -> _DeploymentSpec:
+        if self.min_pod_replicas != 1 or self.max_pod_replicas != 1:
+            raise ValueError(
+                "BYOC manifests require minPodReplicas=maxPodReplicas=1; "
+                "configure autoscaling with the schedule commands after deployment"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -50,38 +67,21 @@ class ByocManifest:
 
     path: Path
     model_repo: ModelRepoCreate
-    deployment: dict[str, Any]
+    deployment: _DeploymentSpec
 
     @property
     def deployment_name(self) -> str:
-        return self.deployment["name"]
+        return self.deployment.name
 
     def deployment_payload(
         self, *, org_id: str, model_repo_id: str
     ) -> DeploymentCreate:
         """Build the deployment after resolving the repository UUID."""
-        values = self.deployment
-        kwargs: dict[str, Any] = {
-            "model_repo": model_repo_id,
-            "org": org_id,
-            "gpu_id": values["gpuId"],
-            "name": values["name"],
-            "min_pod_replicas": values["minPodReplicas"],
-            "max_pod_replicas": values["maxPodReplicas"],
-            "auth_enabled": values.get("authEnabled", False),
-        }
-        optional_fields = {
-            "envVariables": "env_variables",
-            "healthcheck": "healthcheck",
-            "ports": "ports",
-            "metricsPath": "metrics_path",
-            "deploymentCustomConfiguration": "deployment_custom_configuration",
-            "deploymentTag": "deployment_tag",
-        }
-        for manifest_key, payload_key in optional_fields.items():
-            if manifest_key in values:
-                kwargs[payload_key] = values[manifest_key]
-        return DeploymentCreate(**kwargs)
+        return DeploymentCreate(
+            model_repo=model_repo_id,
+            org=org_id,
+            **self.deployment.model_dump(exclude={"model_repo_name"}),
+        )
 
 
 def load_byoc_manifest(path: str | Path, *, org_id: str) -> ByocManifest:
@@ -136,25 +136,9 @@ def load_byoc_manifest(path: str | Path, *, org_id: str) -> ByocManifest:
         "modelRepository",
     )
     _reject_unknown_keys(model_repository, _MODEL_REPOSITORY_KEYS, "modelRepository")
-    _required_keys(
-        deployment,
-        {
-            "name",
-            "modelRepoName",
-            "gpuId",
-            "minPodReplicas",
-            "maxPodReplicas",
-            "healthcheck",
-            "ports",
-            "metricsPath",
-            "deploymentCustomConfiguration",
-        },
-        "deployment",
-    )
-    _reject_unknown_keys(deployment, _DEPLOYMENT_KEYS, "deployment")
-
+    deployment_spec = _DeploymentSpec.model_validate(deployment)
     model_repo_name = _string(model_repository["name"], "modelRepository.name")
-    if deployment["modelRepoName"] != model_repo_name:
+    if deployment_spec.model_repo_name != model_repo_name:
         raise ManifestError(
             "deployment.modelRepoName must exactly match modelRepository.name"
         )
@@ -173,7 +157,7 @@ def load_byoc_manifest(path: str | Path, *, org_id: str) -> ByocManifest:
         **_optional_model_repo_values(model_repository),
     )
     return ByocManifest(
-        path=manifest_path, model_repo=model_repo, deployment=deployment
+        path=manifest_path, model_repo=model_repo, deployment=deployment_spec
     )
 
 

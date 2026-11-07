@@ -98,6 +98,27 @@ def _delta_text(delta: dict[str, Any]) -> tuple[str, str]:
     return content, reasoning
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _validate_positive_counts(args: argparse.Namespace) -> None:
+    for option, value in (
+        ("--num-prompts", args.num_prompts),
+        ("--concurrency", args.concurrency),
+        ("--input-tokens", args.input_tokens),
+        ("--output-tokens", args.output_tokens),
+    ):
+        if value < 1:
+            raise ValueError(f"{option} must be a positive integer")
+
+
 async def one_request(
     client: httpx.AsyncClient,
     *,
@@ -132,6 +153,7 @@ async def one_request(
     total_tokens = 0
     usage_reported = False
     status: int | None = None
+    stream_done = False
 
     try:
         if stream:
@@ -164,11 +186,15 @@ async def one_request(
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        stream_done = True
                         break
                     try:
                         chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("malformed SSE data: expected JSON") from exc
+
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        raise RuntimeError("stream returned an error payload")
 
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta") or {}
@@ -189,6 +215,8 @@ async def one_request(
                             usage.get("completion_tokens") or completion_tokens
                         )
                         total_tokens = int(usage.get("total_tokens") or total_tokens)
+                if not stream_done:
+                    raise RuntimeError("stream ended before [DONE]")
         else:
             response = await client.post(
                 url,
@@ -259,6 +287,7 @@ async def one_request(
 
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    _validate_positive_counts(args)
     base = args.base_url.rstrip("/")
     if base.endswith("/v1"):
         chat_url = f"{base}/chat/completions"
@@ -279,17 +308,20 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     extra_body: dict[str, Any] = {}
     if args.disable_thinking:
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-    semaphore = asyncio.Semaphore(args.concurrency)
 
     async with httpx.AsyncClient(verify=not args.insecure, timeout=args.timeout) as client:
         health = await client.get(health_url)
         if health.status_code >= 400:
             raise RuntimeError(f"health check failed: HTTP {health.status_code}")
 
-        results: list[RequestResult] = []
+        results_by_index: list[RequestResult | None] = [None] * args.num_prompts
+        next_index = 0
 
-        async def worker(index: int) -> None:
-            async with semaphore:
+        async def worker() -> None:
+            nonlocal next_index
+            while next_index < args.num_prompts:
+                index = next_index
+                next_index += 1
                 result = await one_request(
                     client,
                     url=chat_url,
@@ -302,7 +334,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     timeout_s=args.timeout,
                     extra_body=extra_body,
                 )
-                results.append(result)
+                results_by_index[index] = result
                 status = "ok" if result.ok else f"err:{result.error}"
                 ttft = (
                     f"ttft={result.ttft_ms:.0f}ms"
@@ -317,8 +349,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
         wall_started = time.perf_counter()
-        await asyncio.gather(*(worker(i) for i in range(args.num_prompts)))
+        async with asyncio.TaskGroup() as task_group:
+            for _ in range(min(args.concurrency, args.num_prompts)):
+                task_group.create_task(worker())
         wall_s = time.perf_counter() - wall_started
+        results = [result for result in results_by_index if result is not None]
 
     ok_results = [r for r in results if r.ok]
     latencies = [r.latency_ms for r in ok_results]
@@ -426,10 +461,10 @@ def parse_args() -> argparse.Namespace:
         default="smoke",
         help="smoke = connectivity only; decode = long-output throughput workload",
     )
-    parser.add_argument("--num-prompts", type=int, default=8)
-    parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--input-tokens", type=int, default=128)
-    parser.add_argument("--output-tokens", type=int, default=64)
+    parser.add_argument("--num-prompts", type=_positive_int, default=8)
+    parser.add_argument("--concurrency", type=_positive_int, default=1)
+    parser.add_argument("--input-tokens", type=_positive_int, default=128)
+    parser.add_argument("--output-tokens", type=_positive_int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
