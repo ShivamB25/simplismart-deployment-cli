@@ -340,3 +340,8 @@ uv lock
 uv lock --upgrade && uv sync
 uv run pytest -q
 ```
+
+The permanent suite runs real CLI input validation, manifest environment
+validation, and scheduling/time-zone logic. It does not simulate the SDK or a
+deployment manager. Do not count offline checks as live provider verification;
+report actual CLI smoke checks separately.

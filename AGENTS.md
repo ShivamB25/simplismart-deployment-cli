@@ -53,7 +53,7 @@
   change. A failed verification may follow an applied edit: inspect before retry.
 - Keep manifest env references consistent; rotating `.env`'s `HF_TOKEN` needs no
   YAML edit when `${HF_TOKEN}` is already used. SDK minimum: `0.1.15`.
-- API/input/secret regression coverage and operations: Serena
+- Environment-update verification scope and operations: Serena
   `mem:ops/environment_updates`.
 
 ## Local off-only auto-stop
@@ -83,3 +83,11 @@
 - Incident audits must not print secret matches, prefixes, hashes, raw histories,
   or unredacted scanner reports. Revocation is containment, not proof of cause;
   distinguish public Git refs, local stash/reflog objects, and ignored artifacts.
+
+## Tests
+
+- Do not reintroduce fake SDK clients/managers, mock-echo tests, call-forwarding
+  assertions, or help/display-wording snapshots.
+- Keep permanent tests on actual parsing, input validation, and scheduling logic.
+  Report CLI smoke evidence separately; a local HTTP fixture is not a live
+  Simplismart integration check.

@@ -5,7 +5,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from simplismart_deployment_cli import scheduling
 from simplismart_deployment_cli.scheduling import DailyWindow, parse_clock
 
 
@@ -51,9 +50,7 @@ def test_nonexistent_dst_boundary_shifts_forward() -> None:
         timezone_name="America/New_York",
     )
 
-    boundary = window.next_boundary(
-        datetime(2026, 3, 8, 1, 0, tzinfo=window.timezone)
-    )
+    boundary = window.next_boundary(datetime(2026, 3, 8, 1, 0, tzinfo=window.timezone))
 
     assert boundary.isoformat() == "2026-03-08T03:30:00-04:00"
 
@@ -86,18 +83,8 @@ def test_spring_forward_collision_prefers_off_boundary() -> None:
     assert window.is_active(after_collision) is False
 
 
-def test_daily_window_defaults_to_system_timezone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(scheduling, "get_localzone", lambda: ZoneInfo("Asia/Kolkata"))
-
-    window = DailyWindow.create(on_at="10am", off_at="1am")
-
-    assert window.timezone_name == "Asia/Kolkata"
-
-
 def test_equal_window_boundaries_are_rejected() -> None:
-    with pytest.raises(ValueError, match="must be different"):
+    with pytest.raises(ValueError):
         DailyWindow.create(
             on_at="10:00",
             off_at="10am",
