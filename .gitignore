@@ -14,8 +14,16 @@ wheels/
 .env.*
 !.env.example
 
-# Local agent tooling
-.serena/
+# Share reviewed test/state guidance, not local agent settings, caches, or ops notes.
+.serena/*
+!.serena/memories/
+.serena/memories/*
+!.serena/memories/core.md
+!.serena/memories/conventions.md
+!.serena/memories/task_completion.md
+!.serena/memories/architecture/
+.serena/memories/architecture/*
+!.serena/memories/architecture/state_machines.md
 .codegraph/
 results/**
 .DS_Store

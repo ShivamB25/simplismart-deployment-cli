@@ -34,6 +34,36 @@
   image, model, GPU, and deployment ID.
 - Do not attribute `FetchFailed` to command flags without startup logs.
 
+## State-machine changes
+
+- Inventory meaningful stateful workflows before changing them: observed state,
+  desired state, guards, side effects, completion criteria, and failure exits.
+  Do not turn every conditional into an FSM or introduce a generic framework.
+- A documented status catalogue is not a per-action permission matrix. SDK
+  `0.1.15` documents 17 deployment states, not just the five CLI list filters;
+  this includes edit, warm-pool, and failed-deletion states. Preserve provider
+  dispatch for recognized states instead of guessing new lifecycle bans.
+  Recheck the catalogue when upgrading the SDK.
+- Preserve start no-ops for `DEPLOYED`/`PENDING`, stop no-op for `STOPPED`, and
+  intentionally non-idempotent restart. Missing/unrecognized states fail closed;
+  start/stop/restart refuse `DELETED`, and deleting a deleted UUID is a no-op.
+- Keep status separate from health, and saved configuration separate from a
+  verified rollout. Native replica windows, finite `schedule reconcile`, and
+  foreground `schedule run` are different workflows, not interchangeable.
+- Validate manifest input before API calls. Malformed listings or unavailable
+  detail for a matched ID are not proof of absence: refuse creation rather than
+  silently selecting a create/replacement path.
+- Creation, environment edits, and multi-target commands are not transactions.
+  A failure may follow applied side effects; inspect before retrying. Do not add
+  automatic rollback, delete/recreate, or persistent workflow machinery.
+- Bound benchmark workers by concurrency; reject non-positive counts before
+  HTTP. Streaming success requires `[DONE]`; truncated, malformed, or in-band
+  error streams fail even when usage reaches the token budget.
+- Stop-job locking must work on macOS and Linux, span listing through actual
+  stop completion, and release on process exit. Do not require a `flock`
+  executable or let listing/parsing failures look like an empty successful run.
+- Architecture and verification boundaries: Serena `mem:architecture/state_machines`.
+
 ## Deployment environment updates
 
 - Rotate container credentials with
@@ -91,3 +121,15 @@
 - Keep permanent tests on actual parsing, input validation, and scheduling logic.
   Report CLI smoke evidence separately; a local HTTP fixture is not a live
   Simplismart integration check.
+- Keep the smallest set covering distinct consumer-visible failure modes. Do
+  not add private-helper matrices, repeated invalid SDK-field/type variants,
+  or tests that merely pin dependency validators, copies, or incidental defaults.
+  Retain meaningful boundaries such as manifest fail-fast validation and DST.
+- No test-count targets: more cases are not evidence of better coverage.
+  Remove redundant/obsolete cases instead of re-pinning implementation details.
+- Use throwaway localhost HTTP or isolated shell smoke scenarios for orchestration;
+  never mutate live deployments merely to test a guard. Report fixture/tokenizer
+  substitutions and other unexercised boundaries explicitly.
+- Exercise the changed behavior, not just startup: `--help` is only a startup
+  check. Run the relevant suite after final edits and remove throwaway scripts
+  before committing. Guidance-only changes need no new tests or cloud calls.
